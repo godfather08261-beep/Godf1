@@ -2403,7 +2403,7 @@ if __name__ == '__main__':
     # Render-safe startup: remove any old Telegram webhook before polling.
     # This prevents Telegram API error 409 (getUpdates while webhook is active).
     try:
-        bot.remove_webhook()
+        bot.delete_webhook(drop_pending_updates=True)
         time.sleep(1)
         logger.info("🧹 Telegram webhook removed; polling is ready.")
     except Exception as e:

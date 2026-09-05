@@ -2399,6 +2399,16 @@ if __name__ == '__main__':
                 f"📁 Base Dir: {BASE_DIR}\n📂 Upload Dir: {UPLOAD_BOTS_DIR}\n" +
                 f"🗄️ Data Dir: {IROTECH_DIR}\n👑 Owner ID: {OWNER_ID}\n👥 Admins: {admin_ids}\n")
     keep_alive()
+
+    # Render-safe startup: remove any old Telegram webhook before polling.
+    # This prevents Telegram API error 409 (getUpdates while webhook is active).
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        logger.info("🧹 Telegram webhook removed; polling is ready.")
+    except Exception as e:
+        logger.warning(f"⚠️ Could not remove Telegram webhook: {e}")
+
     logger.info("🔄 Starting polling...")
     while True:
         try:

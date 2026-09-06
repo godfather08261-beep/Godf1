@@ -87,6 +87,7 @@ active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_clones = {}
+pending_uploads = {}
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(level=logging.INFO,
@@ -127,6 +128,9 @@ def init_db():
                      (user_id INTEGER PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS clone_bots
                      (user_id INTEGER PRIMARY KEY, bot_username TEXT, token TEXT, create_time TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS pending_uploads
+                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, file_name TEXT,
+                      file_type TEXT, temp_path TEXT, created_at TEXT)''')
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
              c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
@@ -155,6 +159,19 @@ def load_data():
             if user_id not in user_files:
                 user_files[user_id] = []
             user_files[user_id].append((file_name, file_type))
+
+        c.execute('SELECT id, user_id, file_name, file_type, temp_path, created_at FROM pending_uploads ORDER BY id')
+        for pending_id, p_user_id, p_file_name, p_file_type, p_temp_path, p_created_at in c.fetchall():
+            if os.path.exists(p_temp_path):
+                pending_uploads[pending_id] = {
+                    'user_id': p_user_id, 'file_name': p_file_name,
+                    'file_type': p_file_type, 'temp_path': p_temp_path,
+                    'created_at': p_created_at
+                }
+            else:
+                logger.warning(f"⚠️ Pending upload {pending_id} file missing; removing record.")
+                c.execute('DELETE FROM pending_uploads WHERE id = ?', (pending_id,))
+        conn.commit()
 
         c.execute('SELECT user_id FROM active_users')
         active_users.update(user_id for (user_id,) in c.fetchall())
@@ -841,6 +858,197 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data='check_files'))
     return markup
 
+# ===== PENDING UPLOAD APPROVAL SYSTEM =====
+class ApprovalMessage:
+    def __init__(self, user_id):
+        self.from_user = type('ApprovalUser', (), {'id': user_id, 'first_name': 'User', 'last_name': ''})()
+        self.chat = type('ApprovalChat', (), {'id': user_id})()
+        self.message_id = 0
+
+
+def save_pending_upload(user_id, file_name, file_type, temp_path):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        try:
+            created_at = datetime.now().isoformat()
+            c.execute('''INSERT INTO pending_uploads
+                         (user_id, file_name, file_type, temp_path, created_at)
+                         VALUES (?, ?, ?, ?, ?)''',
+                      (user_id, file_name, file_type, temp_path, created_at))
+            pending_id = c.lastrowid
+            conn.commit()
+            pending_uploads[pending_id] = {
+                'user_id': user_id, 'file_name': file_name, 'file_type': file_type,
+                'temp_path': temp_path, 'created_at': created_at
+            }
+            return pending_id
+        except Exception as e:
+            logger.error(f"❌ Error saving pending upload for {user_id}: {e}", exc_info=True)
+            return None
+        finally:
+            conn.close()
+
+
+def remove_pending_upload(pending_id):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        try:
+            c.execute('DELETE FROM pending_uploads WHERE id = ?', (pending_id,))
+            conn.commit()
+            return pending_uploads.pop(pending_id, None)
+        except Exception as e:
+            logger.error(f"❌ Error removing pending upload {pending_id}: {e}", exc_info=True)
+            return None
+        finally:
+            conn.close()
+
+
+def create_pending_approval_markup(pending_id):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton('✅ Approve', callback_data=f'approve_upload_{pending_id}'),
+        types.InlineKeyboardButton('❌ Reject', callback_data=f'reject_upload_{pending_id}')
+    )
+    return markup
+
+
+def pending_approvals_callback(call):
+    admin_id = call.from_user.id
+    if admin_id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    if not pending_uploads:
+        bot.edit_message_text('📥 Pending Approvals\n\nNo files waiting for approval.',
+                              call.message.chat.id, call.message.message_id,
+                              reply_markup=create_admin_panel())
+        return
+    lines = ['📥 Pending Approvals', '']
+    for pending_id, info in list(sorted(pending_uploads.items()))[:30]:
+        lines.append(f"#{pending_id} — `{info['file_name']}` ({info['file_type'].upper()})\n👤 User: `{info['user_id']}`")
+    if len(pending_uploads) > 30:
+        lines.append(f"\n…and {len(pending_uploads) - 30} more.")
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for pending_id, info in list(sorted(pending_uploads.items()))[:30]:
+        markup.add(types.InlineKeyboardButton(
+            f"#{pending_id} • {info['file_name']} • User {info['user_id']}",
+            callback_data=f'pending_view_{pending_id}'
+        ))
+    markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel_back'))
+    bot.edit_message_text('\n'.join(lines), call.message.chat.id, call.message.message_id,
+                          reply_markup=markup, parse_mode='Markdown')
+
+
+def pending_view_callback(call, pending_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    info = pending_uploads.get(pending_id)
+    if not info:
+        bot.answer_callback_query(call.id, '❓ Approval request not found.', show_alert=True)
+        pending_approvals_callback(call)
+        return
+    bot.answer_callback_query(call.id)
+    text = (f"📥 **File Approval Request**\n\n"
+            f"🆔 Request: `{pending_id}`\n"
+            f"👤 User ID: `{info['user_id']}`\n"
+            f"📄 File: `{info['file_name']}`\n"
+            f"📦 Type: `{info['file_type'].upper()}`\n"
+            f"🕒 Submitted: `{info['created_at']}`\n\n"
+            f"Choose an action:")
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                          reply_markup=create_pending_approval_markup(pending_id), parse_mode='Markdown')
+
+
+def approve_pending_upload(call, pending_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    info = pending_uploads.get(pending_id)
+    if not info:
+        bot.answer_callback_query(call.id, '❓ Approval request already handled.', show_alert=True)
+        return
+    temp_path = info['temp_path']
+    if not os.path.exists(temp_path):
+        remove_pending_upload(pending_id)
+        bot.answer_callback_query(call.id, '❌ Pending file is missing.', show_alert=True)
+        bot.send_message(info['user_id'], f"❌ Your file `{info['file_name']}` could not be approved because the stored file is missing. Please upload again.", parse_mode='Markdown')
+        return
+
+    user_id = info['user_id']
+    file_name = info['file_name']
+    file_type = info['file_type']
+    try:
+        if get_user_file_count(user_id) >= get_user_file_limit(user_id):
+            bot.answer_callback_query(call.id, '⚠️ User file limit reached.', show_alert=True)
+            bot.send_message(user_id, f"⚠️ Your file limit is full. `{file_name}` was not approved. Delete a file and upload again.", parse_mode='Markdown')
+            return
+
+        if file_type == 'zip':
+            with open(temp_path, 'rb') as f:
+                content = f.read()
+            remove_pending_upload(pending_id)
+            os.remove(temp_path)
+            proxy = ApprovalMessage(user_id)
+            bot.answer_callback_query(call.id, '✅ Approved. Processing ZIP...')
+            bot.send_message(user_id, f"✅ Your ZIP `{file_name}` was approved by admin. Processing now...", parse_mode='Markdown')
+            handle_zip_file(content, file_name, proxy)
+        else:
+            user_folder = get_user_folder(user_id)
+            file_path = os.path.join(user_folder, file_name)
+            shutil.move(temp_path, file_path)
+            remove_pending_upload(pending_id)
+            save_user_file(user_id, file_name, file_type)
+            bot.answer_callback_query(call.id, '✅ File approved.')
+            bot.send_message(user_id, f"✅ Your file `{file_name}` was approved by admin and is starting now.", parse_mode='Markdown')
+            if file_type == 'py':
+                threading.Thread(target=run_script, args=(file_path, user_id, user_folder, file_name, ApprovalMessage(user_id))).start()
+            elif file_type == 'js':
+                threading.Thread(target=run_js_script, args=(file_path, user_id, user_folder, file_name, ApprovalMessage(user_id))).start()
+        logger.info(f"✅ Pending upload #{pending_id} approved by admin {call.from_user.id} for user {user_id}: {file_name}")
+        try:
+            bot.edit_message_text(f"✅ Approved: `{file_name}` for User `{user_id}`.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+        except Exception:
+            pass
+    except Exception as e:
+        logger.error(f"❌ Error approving pending upload #{pending_id}: {e}", exc_info=True)
+        bot.answer_callback_query(call.id, '❌ Approval failed. Check logs.', show_alert=True)
+        bot.send_message(user_id, f"⚠️ Approval of `{file_name}` failed. Please contact admin.", parse_mode='Markdown')
+
+
+def reject_pending_upload(call, pending_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    info = pending_uploads.get(pending_id)
+    if not info:
+        bot.answer_callback_query(call.id, '❓ Approval request already handled.', show_alert=True)
+        return
+    removed = remove_pending_upload(pending_id)
+    try:
+        if removed and os.path.exists(removed['temp_path']):
+            os.remove(removed['temp_path'])
+    except Exception as e:
+        logger.error(f"❌ Failed deleting rejected pending file #{pending_id}: {e}")
+    bot.answer_callback_query(call.id, '❌ File rejected.')
+    bot.send_message(info['user_id'], f"❌ Your file `{info['file_name']}` was rejected by admin.", parse_mode='Markdown')
+    logger.info(f"❌ Pending upload #{pending_id} rejected by admin {call.from_user.id} for user {info['user_id']}: {info['file_name']}")
+    try:
+        bot.edit_message_text(f"❌ Rejected: `{info['file_name']}` for User `{info['user_id']}`.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
+    except Exception:
+        pass
+
+
+def admin_panel_back_callback(call):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text('👑 Admin Panel\nManage admins and pending uploads.', call.message.chat.id,
+                          call.message.message_id, reply_markup=create_admin_panel())
+
 # ===== CREATE ADMIN PANEL =====
 def create_admin_panel():
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -849,6 +1057,7 @@ def create_admin_panel():
         types.InlineKeyboardButton('➖ Remove', callback_data='remove_admin')
     )
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
+    markup.row(types.InlineKeyboardButton('📥 Pending Approvals', callback_data='pending_approvals'))
     markup.row(types.InlineKeyboardButton('🔙 Back', callback_data='back_to_main'))
     return markup
 
@@ -1379,26 +1588,59 @@ def handle_file_upload_doc(message):
         bot.reply_to(message, f"⚠️ File too large (Max: {max_file_size // 1024 // 1024} MB)."); return
 
     try:
-        try:
-            bot.forward_message(OWNER_ID, chat_id, message.message_id)
-            bot.send_message(OWNER_ID, f"📎 File '{file_name}' from {message.from_user.first_name} {message.from_user.last_name or ''} (`{user_id}`)", parse_mode='Markdown')
-        except Exception as e: logger.error(f"❌ Failed to forward uploaded file to OWNER_ID {OWNER_ID}: {e}")
-
         download_wait_msg = bot.reply_to(message, f"⏳ Downloading `{file_name}`...")
         file_info_tg_doc = bot.get_file(doc.file_id)
         downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
-        bot.edit_message_text(f"✅ Downloaded `{file_name}`. Processing...", chat_id, download_wait_msg.message_id)
+        bot.edit_message_text(f"✅ Downloaded `{file_name}`. Sending for admin approval...", chat_id, download_wait_msg.message_id)
         logger.info(f"✅ Downloaded {file_name} for user {user_id}")
-        user_folder = get_user_folder(user_id)
 
-        if file_ext == '.zip':
-            handle_zip_file(downloaded_file_content, file_name, message)
-        else:
-            file_path = os.path.join(user_folder, file_name)
-            with open(file_path, 'wb') as f: f.write(downloaded_file_content)
-            logger.info(f"💾 Saved single file to {file_path}")
-            if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
-            elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
+        # Owner/Admin uploads continue immediately; normal users require approval.
+        if user_id in admin_ids:
+            user_folder = get_user_folder(user_id)
+            if file_ext == '.zip':
+                handle_zip_file(downloaded_file_content, file_name, message)
+            else:
+                file_path = os.path.join(user_folder, file_name)
+                with open(file_path, 'wb') as f: f.write(downloaded_file_content)
+                logger.info(f"💾 Saved admin file to {file_path}")
+                if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
+                elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
+            return
+
+        pending_dir = os.path.join(IROTECH_DIR, 'pending_uploads')
+        os.makedirs(pending_dir, exist_ok=True)
+        safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', file_name)
+        temp_path = os.path.join(pending_dir, f"{user_id}_{int(time.time() * 1000)}_{safe_name}")
+        with open(temp_path, 'wb') as f:
+            f.write(downloaded_file_content)
+        pending_id = save_pending_upload(user_id, file_name, file_ext.lstrip('.'), temp_path)
+        if not pending_id:
+            os.remove(temp_path)
+            bot.reply_to(message, '❌ Could not create approval request. Please try again.')
+            return
+
+        approval_text = (f"📥 **New File Approval Request**\n\n"
+                         f"🆔 Request: `{pending_id}`\n"
+                         f"👤 Name: {message.from_user.first_name} {message.from_user.last_name or ''}\n"
+                         f"📱 Username: @{message.from_user.username or 'N/A'}\n"
+                         f"🆔 User ID: `{user_id}`\n"
+                         f"📄 File: `{file_name}`\n"
+                         f"📦 Type: `{file_ext.lstrip('.').upper()}`\n\n"
+                         f"⏳ Waiting for admin approval.")
+        # Send approval controls to every configured admin.
+        for admin_id in list(admin_ids):
+            try:
+                bot.send_message(admin_id, approval_text, reply_markup=create_pending_approval_markup(pending_id), parse_mode='Markdown')
+                if admin_id == OWNER_ID:
+                    try:
+                        bot.forward_message(OWNER_ID, chat_id, message.message_id)
+                    except Exception as e:
+                        logger.error(f"❌ Failed to forward pending file to OWNER_ID: {e}")
+            except Exception as e:
+                logger.error(f"❌ Failed to notify admin {admin_id} about pending upload #{pending_id}: {e}")
+
+        bot.send_message(chat_id, f"⏳ Your file `{file_name}` has been submitted for admin approval. You will be notified after approval.", parse_mode='Markdown')
+        logger.info(f"📥 Pending upload #{pending_id} created for user {user_id}: {file_name}")
     except telebot.apihelper.ApiTelegramException as e:
          logger.error(f"❌ Telegram API Error handling file for {user_id}: {e}", exc_info=True)
          if "file is too big" in str(e).lower():
@@ -1447,6 +1689,16 @@ def handle_callbacks(call):
             owner_required_callback(call, remove_admin_init_callback)
         elif data == 'list_admins':
             admin_required_callback(call, list_admins_callback)
+        elif data == 'pending_approvals':
+            admin_required_callback(call, pending_approvals_callback)
+        elif data == 'admin_panel_back':
+            admin_required_callback(call, admin_panel_back_callback)
+        elif data.startswith('pending_view_'):
+            admin_required_callback(call, lambda c: pending_view_callback(c, int(c.data.split('_', 2)[2])))
+        elif data.startswith('approve_upload_'):
+            admin_required_callback(call, lambda c: approve_pending_upload(c, int(c.data.split('_', 2)[2])))
+        elif data.startswith('reject_upload_'):
+            admin_required_callback(call, lambda c: reject_pending_upload(c, int(c.data.split('_', 2)[2])))
         elif data == 'add_subscription':
             admin_required_callback(call, add_subscription_init_callback)
         elif data == 'remove_subscription':
@@ -2403,7 +2655,7 @@ if __name__ == '__main__':
     # Render-safe startup: remove any old Telegram webhook before polling.
     # This prevents Telegram API error 409 (getUpdates while webhook is active).
     try:
-        bot.delete_webhook(drop_pending_updates=True)
+        bot.remove_webhook()
         time.sleep(1)
         logger.info("🧹 Telegram webhook removed; polling is ready.")
     except Exception as e:

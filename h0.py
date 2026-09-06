@@ -778,7 +778,7 @@ def clone_stop_callback(call, clone_user_id):
     if proc is None:
         bot.answer_callback_query(call.id, '🔴 Clone is already stopped.', show_alert=True)
     else:
-        try: kill_process_tree(proc)
+        try: stop_clone_process(proc)
         except Exception as e: logger.error(f'❌ Error stopping clone {clone_user_id}: {e}', exc_info=True)
         clone_processes.pop(clone_user_id, None)
         handle = clone_log_handles.pop(clone_user_id, None)
@@ -800,7 +800,7 @@ def clone_restart_callback(call, clone_user_id):
         bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
     proc = get_clone_process(clone_user_id)
     if proc is not None:
-        try: kill_process_tree(proc)
+        try: stop_clone_process(proc)
         except Exception as e: logger.error(f'❌ Error stopping clone for restart {clone_user_id}: {e}', exc_info=True)
         clone_processes.pop(clone_user_id, None)
         handle = clone_log_handles.pop(clone_user_id, None)
@@ -845,7 +845,7 @@ def clone_ban_confirm_callback(call, clone_user_id):
         bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
     proc = get_clone_process(clone_user_id)
     if proc is not None:
-        try: kill_process_tree(proc)
+        try: stop_clone_process(proc)
         except Exception as e: logger.error(f'❌ Error banning clone {clone_user_id}: {e}', exc_info=True)
     clone_processes.pop(clone_user_id, None)
     handle = clone_log_handles.pop(clone_user_id, None)
@@ -1007,6 +1007,69 @@ def kill_process_tree(process_info):
         else: logger.error(f"❌ Process object missing for {script_key}, and no log file. Cannot kill.")
     except Exception as e:
         logger.error(f"❌ Unexpected error killing process tree for PID {pid or 'N/A'} ({script_key}): {e}", exc_info=True)
+
+# ===== CLONE PROCESS TERMINATION =====
+def stop_clone_process(process):
+    """Reliably stop a clone subprocess and its entire process group."""
+    if process is None:
+        return True
+
+    try:
+        pid = process.pid
+    except Exception:
+        return True
+
+    if not pid:
+        return True
+
+    # create_bot_clone() starts each clone with start_new_session=True, so the
+    # clone PID is the leader of its own process group. Killing that group
+    # prevents child workers/polling processes from remaining alive.
+    try:
+        if process.poll() is None:
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    process.wait(timeout=2)
+                except Exception:
+                    pass
+
+        # Extra psutil cleanup for descendants that may have escaped the
+        # process-group termination.
+        try:
+            parent = psutil.Process(pid)
+            children = parent.children(recursive=True)
+            for child in children:
+                try:
+                    if child.is_running():
+                        child.kill()
+                except (psutil.NoSuchProcess, psutil.ZombieProcess):
+                    pass
+        except (psutil.NoSuchProcess, psutil.ZombieProcess):
+            pass
+
+        logger.info(f"🛑 Clone process terminated for PID {pid}")
+        return process.poll() is not None
+    except Exception as e:
+        logger.error(f"❌ Failed to terminate clone PID {pid}: {e}", exc_info=True)
+        # Last-resort Popen kill.
+        try:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=2)
+            return process.poll() is not None
+        except Exception:
+            return False
 
 # ===== PYTHON MODULES MAPPING =====
 TELEGRAM_MODULES = {
@@ -2092,7 +2155,7 @@ def user_clone_stop_callback(call):
         bot.answer_callback_query(call.id, "🔴 Clone is already stopped.", show_alert=True)
     else:
         try:
-            kill_process_tree(proc)
+            stop_clone_process(proc)
         except Exception as e:
             logger.error(f"❌ Error stopping user clone {user_id}: {e}", exc_info=True)
         clone_processes.pop(user_id, None)
@@ -2115,7 +2178,7 @@ def user_clone_restart_callback(call):
     proc = get_clone_process(user_id)
     if proc is not None:
         try:
-            kill_process_tree(proc)
+            stop_clone_process(proc)
         except Exception as e:
             logger.error(f"❌ Error stopping user clone {user_id} for restart: {e}", exc_info=True)
         clone_processes.pop(user_id, None)
@@ -3392,7 +3455,7 @@ def cleanup():
     for clone_user_id, proc in list(clone_processes.items()):
         try:
             if proc.poll() is None:
-                kill_process_tree(proc)
+                stop_clone_process(proc)
                 logger.info(f"🧹 Stopped clone worker for user {clone_user_id} (PID {proc.pid}).")
         except Exception as e:
             logger.error(f"❌ Failed stopping clone worker {clone_user_id}: {e}")

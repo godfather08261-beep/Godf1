@@ -88,6 +88,10 @@ admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_clones = {}
 pending_clone_requests = {}
+# Running clone processes keyed by owner/user ID.
+clone_processes = {}
+clone_log_handles = {}
+clone_banned_users = set()
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(level=logging.INFO,
@@ -131,6 +135,8 @@ def init_db():
         c.execute('''CREATE TABLE IF NOT EXISTS clone_requests
                      (user_id INTEGER PRIMARY KEY, bot_username TEXT, token TEXT,
                       request_time TEXT, status TEXT DEFAULT 'pending')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS clone_bans
+                     (user_id INTEGER PRIMARY KEY, ban_time TEXT)''')
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
              c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
@@ -165,6 +171,9 @@ def load_data():
 
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
+
+        c.execute('SELECT user_id FROM clone_bans')
+        clone_banned_users.update(int(row[0]) for row in c.fetchall())
 
         c.execute('SELECT user_id, bot_username, token, create_time FROM clone_bots')
         for user_id, bot_username, token, create_time in c.fetchall():
@@ -521,6 +530,213 @@ def clone_reject_callback(call, request_user_id):
         call.message.message_id,
         reply_markup=create_clone_request_panel()
     )
+
+
+# ===== ADMIN CLONE MANAGEMENT =====
+def get_clone_process(user_id):
+    user_id = int(user_id)
+    proc = clone_processes.get(user_id)
+    if proc is not None:
+        try:
+            if proc.poll() is None:
+                return proc
+        except Exception:
+            pass
+        clone_processes.pop(user_id, None)
+        handle = clone_log_handles.pop(user_id, None)
+        if handle:
+            try: handle.close()
+            except Exception: pass
+    return None
+
+
+def clone_status(user_id):
+    return get_clone_process(user_id) is not None
+
+
+def create_clone_management_panel():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    if not user_clones:
+        markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='clone_manage'))
+        markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel'))
+        return markup
+    for clone_user_id, info in list(user_clones.items())[:30]:
+        status = '🟢 Running' if clone_status(clone_user_id) else '🔴 Stopped'
+        markup.add(types.InlineKeyboardButton(
+            f"🤖 @{info['bot_username']} | {clone_user_id} | {status}",
+            callback_data=f'clone_manage_view_{clone_user_id}'
+        ))
+    markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='clone_manage'))
+    markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel'))
+    return markup
+
+
+def clone_manage_callback(call):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    bot.answer_callback_query(call.id)
+    text = '🤖 Clone Bot Management\n\n' + f'📊 Total clones: {len(user_clones)}\n\nSelect a clone:'
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=create_clone_management_panel())
+
+
+def clone_manage_view_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    try:
+        clone_user_id = int(clone_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, '❌ Invalid clone.', show_alert=True)
+        return
+    info = user_clones.get(clone_user_id)
+    if not info:
+        bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True)
+        clone_manage_callback(call)
+        return
+    running = clone_status(clone_user_id)
+    status = '🟢 Running' if running else '🔴 Stopped'
+    text = (f"🤖 Clone Control\n\n"
+            f"Bot: @{info['bot_username']}\n"
+            f"User ID: {clone_user_id}\n"
+            f"Status: {status}\n\n"
+            'Choose an action:')
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    if running:
+        markup.row(types.InlineKeyboardButton('🔴 Stop', callback_data=f'clone_stop_{clone_user_id}'),
+                   types.InlineKeyboardButton('🔄 Restart', callback_data=f'clone_restart_{clone_user_id}'))
+    else:
+        markup.row(types.InlineKeyboardButton('🟢 Start', callback_data=f'clone_start_{clone_user_id}'),
+                   types.InlineKeyboardButton('🔄 Restart', callback_data=f'clone_restart_{clone_user_id}'))
+    markup.add(types.InlineKeyboardButton('🚫 Ban Bot', callback_data=f'clone_ban_{clone_user_id}'))
+    markup.add(types.InlineKeyboardButton('🔙 Clone List', callback_data='clone_manage'))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+
+def clone_start_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True); return
+    clone_user_id = int(clone_user_id)
+    info = user_clones.get(clone_user_id)
+    if not info:
+        bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
+    if clone_status(clone_user_id):
+        bot.answer_callback_query(call.id, '🟢 Clone already running.', show_alert=True)
+        clone_manage_view_callback(call, clone_user_id); return
+    bot.answer_callback_query(call.id, '🚀 Starting clone...')
+    ok = create_bot_clone(clone_user_id, info['token'], info['bot_username'])
+    if ok:
+        try: bot.send_message(clone_user_id, '🚀 Your clone bot was started by an admin.')
+        except Exception: pass
+    else:
+        try: bot.answer_callback_query(call.id, '❌ Clone failed to start. Check logs.', show_alert=True)
+        except Exception: pass
+    clone_manage_view_callback(call, clone_user_id)
+
+
+def clone_stop_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True); return
+    clone_user_id = int(clone_user_id)
+    info = user_clones.get(clone_user_id)
+    if not info:
+        bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
+    proc = get_clone_process(clone_user_id)
+    if proc is None:
+        bot.answer_callback_query(call.id, '🔴 Clone is already stopped.', show_alert=True)
+    else:
+        try: kill_process_tree(proc)
+        except Exception as e: logger.error(f'❌ Error stopping clone {clone_user_id}: {e}', exc_info=True)
+        clone_processes.pop(clone_user_id, None)
+        handle = clone_log_handles.pop(clone_user_id, None)
+        if handle:
+            try: handle.close()
+            except Exception: pass
+        bot.answer_callback_query(call.id, '🛑 Clone stopped.')
+        try: bot.send_message(clone_user_id, '🛑 Your clone bot was stopped by an admin.')
+        except Exception: pass
+    clone_manage_view_callback(call, clone_user_id)
+
+
+def clone_restart_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True); return
+    clone_user_id = int(clone_user_id)
+    info = user_clones.get(clone_user_id)
+    if not info:
+        bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
+    proc = get_clone_process(clone_user_id)
+    if proc is not None:
+        try: kill_process_tree(proc)
+        except Exception as e: logger.error(f'❌ Error stopping clone for restart {clone_user_id}: {e}', exc_info=True)
+        clone_processes.pop(clone_user_id, None)
+        handle = clone_log_handles.pop(clone_user_id, None)
+        if handle:
+            try: handle.close()
+            except Exception: pass
+        time.sleep(1)
+    bot.answer_callback_query(call.id, '🔄 Restarting clone...')
+    ok = create_bot_clone(clone_user_id, info['token'], info['bot_username'])
+    if ok:
+        try: bot.send_message(clone_user_id, '🔄 Your clone bot was restarted by an admin.')
+        except Exception: pass
+    else:
+        try: bot.answer_callback_query(call.id, '❌ Clone restart failed. Check logs.', show_alert=True)
+        except Exception: pass
+    clone_manage_view_callback(call, clone_user_id)
+
+
+def clone_ban_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True); return
+    clone_user_id = int(clone_user_id)
+    info = user_clones.get(clone_user_id)
+    if not info:
+        bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(types.InlineKeyboardButton('🚫 Confirm Ban', callback_data=f'clone_ban_confirm_{clone_user_id}'),
+               types.InlineKeyboardButton('❌ Cancel', callback_data=f'clone_manage_view_{clone_user_id}'))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        f"⚠️ Ban clone @{info['bot_username']}?\n\nThis will stop and permanently remove this clone and block new clone requests for this user.",
+        call.message.chat.id, call.message.message_id, reply_markup=markup
+    )
+
+
+def clone_ban_confirm_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True); return
+    clone_user_id = int(clone_user_id)
+    info = user_clones.get(clone_user_id)
+    if not info:
+        bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
+    proc = get_clone_process(clone_user_id)
+    if proc is not None:
+        try: kill_process_tree(proc)
+        except Exception as e: logger.error(f'❌ Error banning clone {clone_user_id}: {e}', exc_info=True)
+    clone_processes.pop(clone_user_id, None)
+    handle = clone_log_handles.pop(clone_user_id, None)
+    if handle:
+        try: handle.close()
+        except Exception: pass
+    clone_dir = os.path.join(BASE_DIR, f'clone_{clone_user_id}')
+    try:
+        if os.path.exists(clone_dir): shutil.rmtree(clone_dir)
+    except Exception as e: logger.error(f'❌ Error removing banned clone directory {clone_dir}: {e}', exc_info=True)
+    remove_clone_info(clone_user_id)
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            conn.execute('INSERT OR REPLACE INTO clone_bans (user_id, ban_time) VALUES (?, ?)', (clone_user_id, datetime.now().isoformat()))
+            conn.commit()
+            clone_banned_users.add(clone_user_id)
+        finally:
+            conn.close()
+    bot.answer_callback_query(call.id, '🚫 Clone bot banned.')
+    try: bot.send_message(clone_user_id, '🚫 Your clone bot has been banned by an admin.')
+    except Exception: pass
+    clone_manage_callback(call)
 
 
 # ===== REMOVE CLONE INFO =====
@@ -1172,6 +1388,7 @@ def create_admin_panel():
     )
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
     markup.row(types.InlineKeyboardButton('🔔 Clone Requests', callback_data='clone_requests'))
+    markup.row(types.InlineKeyboardButton('🤖 Clone Bots', callback_data='clone_manage'))
     markup.row(types.InlineKeyboardButton('🔙 Back', callback_data='back_to_main'))
     return markup
 
@@ -1312,60 +1529,86 @@ def handle_py_file(file_path, script_owner_id, user_folder, file_name, message):
 
 # ===== CREATE BOT CLONE =====
 def create_bot_clone(user_id, token, bot_username):
-    """Create and start a clone bot after admin approval.
+    """Create and start a real independent clone process.
 
-    The clone gets its own directory and token, while its stdout/stderr are
-    written to a log file so a failed clone cannot silently fill PIPE buffers.
+    The clone receives its token through its environment instead of trying to
+    replace the value of BOT_TOKEN in the source code.  The previous approach
+    could leave the clone with an empty/missing token because the source uses
+    os.environ.get("BOT_TOKEN").
     """
     try:
+        user_id = int(user_id)
+        token = (token or '').strip()
+        if not token or ':' not in token:
+            raise ValueError("Invalid bot token")
+
+        # Do not create a second polling process for the same clone.
+        existing = clone_processes.get(user_id)
+        if existing is not None and existing.poll() is None:
+            logger.info(f"ℹ️ Clone for user {user_id} is already running (PID {existing.pid}).")
+            return True
+
         clone_dir = os.path.join(BASE_DIR, f'clone_{user_id}')
         os.makedirs(clone_dir, exist_ok=True)
+        log_path = os.path.join(clone_dir, 'clone.log')
 
         current_file = __file__
         clone_file = os.path.join(clone_dir, 'bot.py')
-        clone_log = os.path.join(clone_dir, 'clone.log')
 
         with open(current_file, 'r', encoding='utf-8') as f:
             script_content = f.read()
 
-        # Replace only the configured owner/main token values in the source.
-        script_content = script_content.replace(BOT_TOKEN, token)
+        # Make the requesting user the Owner + Admin inside their clone.
         script_content = script_content.replace(str(OWNER_ID), str(user_id))
         script_content = script_content.replace(str(ADMIN_ID), str(user_id))
+
+        # A clone is a Telegram worker, not another Render web service.
+        # This prevents the child process from fighting the main process for
+        # Render's PORT while keeping all bot/admin functionality enabled.
+        script_content = script_content.replace(
+            "if __name__ == '__main__':",
+            "if __name__ == '__main__':"
+        )
+        script_content = script_content.replace(
+            "    keep_alive()\n\n    # Render-safe startup:",
+            "    if os.environ.get('CLONE_MODE') != '1':\n        keep_alive()\n\n    # Render-safe startup:"
+        )
 
         with open(clone_file, 'w', encoding='utf-8') as f:
             f.write(script_content)
 
-        log_file = open(clone_log, 'a', encoding='utf-8')
-        try:
-            clone_process = subprocess.Popen(
-                [sys.executable, clone_file],
-                cwd=clone_dir,
-                stdout=log_file,
-                stderr=log_file,
-                stdin=subprocess.DEVNULL
-            )
-        except Exception:
-            log_file.close()
-            raise
+        # Give the clone its own token at runtime. This is the critical fix:
+        # BOT_TOKEN is read from os.environ when the clone starts.
+        clone_env = os.environ.copy()
+        clone_env['BOT_TOKEN'] = token
+        clone_env['CLONE_MODE'] = '1'
 
-        # Give the clone a moment to fail fast (invalid token, syntax error,
-        # Telegram 409, etc.) before marking the approval as successful.
+        log_handle = open(log_path, 'a', encoding='utf-8', buffering=1)
+        clone_process = subprocess.Popen(
+            [sys.executable, clone_file],
+            cwd=clone_dir,
+            env=clone_env,
+            stdin=subprocess.DEVNULL,
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True
+        )
+
+        # Detect immediate startup failures instead of reporting a false
+        # successful clone.
         time.sleep(2)
-        return_code = clone_process.poll()
-        if return_code is not None:
-            log_file.close()
-            logger.error(
-                f"❌ Clone @{bot_username} exited immediately for user {user_id} "
-                f"with code {return_code}. See {clone_log}"
-            )
+        if clone_process.poll() is not None:
+            log_handle.close()
+            logger.error(f"❌ Clone process exited during startup for {bot_username} (code {clone_process.returncode}). See {log_path}")
             return False
 
+        clone_processes[user_id] = clone_process
+        clone_log_handles[user_id] = log_handle
         save_clone_info(user_id, bot_username, token)
-        logger.info(f"✅ Bot clone created successfully for user {user_id}, bot @{bot_username}")
+        logger.info(f"✅ Bot clone created and started for user {user_id}, bot @{bot_username}, PID={clone_process.pid}")
         return True
     except Exception as e:
-        logger.error(f"❌ Error creating bot clone @{bot_username} for user {user_id}: {e}", exc_info=True)
+        logger.error(f"❌ Error creating bot clone for user {user_id}: {e}", exc_info=True)
         return False
 
 # ===== LOGIC: SEND WELCOME =====
@@ -1815,6 +2058,26 @@ def handle_callbacks(call):
             admin_required_callback(call, remove_subscription_init_callback)
         elif data == 'list_subscriptions':
             admin_required_callback(call, list_subscriptions_callback)
+        elif data == 'clone_manage':
+            admin_required_callback(call, clone_manage_callback)
+        elif data.startswith('clone_manage_view_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_manage_view_callback(c, clone_user_id))
+        elif data.startswith('clone_start_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_start_callback(c, clone_user_id))
+        elif data.startswith('clone_stop_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_stop_callback(c, clone_user_id))
+        elif data.startswith('clone_restart_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_restart_callback(c, clone_user_id))
+        elif data.startswith('clone_ban_confirm_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_ban_confirm_callback(c, clone_user_id))
+        elif data.startswith('clone_ban_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_ban_callback(c, clone_user_id))
         elif data == 'clone_create':
             clone_create_callback(call)
         elif data == 'clone_requests':
@@ -2692,6 +2955,10 @@ def handle_token_input(message, original_chat_id, original_message_id):
         bot.reply_to(message, error_msg, reply_markup=markup, parse_mode="Markdown")
         return
 
+    if user_id in clone_banned_users:
+        bot.reply_to(message, "🚫 Clone bot access is banned for your account by an admin.")
+        return
+
     if user_id in pending_clone_requests:
         bot.reply_to(message, "⏳ You already have a clone request waiting for admin approval.")
         return
@@ -2712,16 +2979,15 @@ def handle_token_input(message, original_chat_id, original_message_id):
         if not save_clone_request(user_id, bot_info.username, token):
             raise RuntimeError("Could not save clone approval request.")
 
-        # Keep clone approval messages as plain text. Bot usernames can contain '_'
-        # (for example @Godsp4m_bot), which can break Telegram Markdown parsing.
         bot.edit_message_text(
-            f"🔔 Approval Requested!\n\n"
+            f"🔔 **Approval Requested!**\n\n"
             f"🤖 Bot: @{bot_info.username}\n"
-            f"👤 User ID: {user_id}\n\n"
+            f"👤 User ID: `{user_id}`\n\n"
             "⏳ Your clone request has been sent to the admin for approval.\n"
             "You will be notified after it is approved or rejected.",
             processing_msg.chat.id,
-            processing_msg.message_id
+            processing_msg.message_id,
+            parse_mode="Markdown"
         )
 
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2740,8 +3006,7 @@ def handle_token_input(message, original_chat_id, original_message_id):
         notified = 0
         for admin_id in list(admin_ids):
             try:
-                # Plain text avoids 400 "can't parse entities" for bot usernames.
-                bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
+                bot.send_message(admin_id, admin_text, reply_markup=admin_markup, parse_mode="Markdown")
                 notified += 1
             except Exception as e:
                 logger.error(f"❌ Failed to notify admin {admin_id} about clone request: {e}")
@@ -2754,25 +3019,43 @@ def handle_token_input(message, original_chat_id, original_message_id):
     except telebot.apihelper.ApiTelegramException as e:
         safe_error = str(e).replace("`", "'")
         bot.edit_message_text(
-            f"❌ Bot Clone Request Failed\n\n"
+            f"❌ **Bot Clone Request Failed**\n\n"
             f"Error: {safe_error}\n\n"
             "💡 Make sure your token is valid and try again.",
             processing_msg.chat.id,
-            processing_msg.message_id
+            processing_msg.message_id,
+            parse_mode="Markdown"
         )
     except Exception as e:
         safe_error = str(e).replace("`", "'")
         logger.error(f"❌ Error creating clone approval request for {user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ Bot Clone Request Failed\n\nError: {safe_error}",
+            f"❌ **Bot Clone Request Failed**\n\nError: {safe_error}",
             processing_msg.chat.id,
-            processing_msg.message_id
+            processing_msg.message_id,
+            parse_mode="Markdown"
         )
 
 
 # ===== CLEANUP FUNCTION =====
 def cleanup():
     logger.warning("🧹 Shutdown. Cleaning up processes...")
+    # Stop clone workers too, so a Render restart cannot leave duplicate
+    # getUpdates pollers behind.
+    for clone_user_id, proc in list(clone_processes.items()):
+        try:
+            if proc.poll() is None:
+                kill_process_tree(proc)
+                logger.info(f"🧹 Stopped clone worker for user {clone_user_id} (PID {proc.pid}).")
+        except Exception as e:
+            logger.error(f"❌ Failed stopping clone worker {clone_user_id}: {e}")
+        finally:
+            handle = clone_log_handles.pop(clone_user_id, None)
+            if handle:
+                try: handle.close()
+                except Exception: pass
+            clone_processes.pop(clone_user_id, None)
+
     script_keys_to_stop = list(bot_scripts.keys())
     if not script_keys_to_stop: logger.info("✅ No scripts running. Exiting."); return
     logger.info(f"🧹 Stopping {len(script_keys_to_stop)} scripts...")
@@ -2787,7 +3070,19 @@ if __name__ == '__main__':
     logger.info("="*40 + "\n🚀 Bot Starting Up...\n" + f"🐍 Python: {sys.version.split()[0]}\n" +
                 f"📁 Base Dir: {BASE_DIR}\n📂 Upload Dir: {UPLOAD_BOTS_DIR}\n" +
                 f"🗄️ Data Dir: {IROTECH_DIR}\n👑 Owner ID: {OWNER_ID}\n👥 Admins: {admin_ids}\n")
-    keep_alive()
+    if os.environ.get('CLONE_MODE') != '1':
+        keep_alive()
+
+    # Restart approved clones after a Render process restart.
+    # Clone credentials are stored in the clone_bots table; each clone gets
+    # its own Telegram polling process and its own owner/admin permissions.
+    if os.environ.get('CLONE_MODE') != '1':
+        for clone_user_id, clone_info in list(user_clones.items()):
+            try:
+                if not create_bot_clone(clone_user_id, clone_info['token'], clone_info['bot_username']):
+                    logger.error(f"❌ Could not restart approved clone @{clone_info['bot_username']} for user {clone_user_id}")
+            except Exception as e:
+                logger.error(f"❌ Error restarting approved clone for user {clone_user_id}: {e}", exc_info=True)
 
     # Render-safe startup: remove any old Telegram webhook before polling.
     # This prevents Telegram API error 409 (getUpdates while webhook is active).

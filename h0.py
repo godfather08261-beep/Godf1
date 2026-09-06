@@ -67,9 +67,9 @@ IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
 DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
 
 # ===== USER LIMITS =====
-FREE_USER_LIMIT = 4
+FREE_USER_LIMIT = 3
 SUBSCRIBED_USER_LIMIT = 25
-ADMIN_LIMIT = 999
+ADMIN_LIMIT = float('inf')
 OWNER_LIMIT = float('inf')
 
 # ===== CREATE DIRECTORIES =====
@@ -103,7 +103,7 @@ COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
     ["📢 Updates Channel"],
     ["📤 Upload File", "📂 Check Files"],
     ["⚡ Bot Speed", "📊 Statistics"],
-    ["🤖 Clone Bot", "📞 Contact Owner"]
+    ["🤖 My Bot", "📞 Contact Owner"]
 ]
 
 ADMIN_COMMAND_BUTTONS_LAYOUT_USER_SPEC = [
@@ -2169,6 +2169,7 @@ BUTTON_TEXT_TO_LOGIC = {
     "🔒 Lock Bot": _logic_toggle_lock_bot,
     "🟢 Run All User Scripts": _logic_run_all_scripts,
     "👑 Admin Panel": _logic_admin_panel,
+    "🤖 My Bot": _logic_clone_bot,
     "🤖 Clone Bot": _logic_clone_bot
 }
 

@@ -87,7 +87,6 @@ active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_clones = {}
-pending_uploads = {}
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(level=logging.INFO,
@@ -128,9 +127,9 @@ def init_db():
                      (user_id INTEGER PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS clone_bots
                      (user_id INTEGER PRIMARY KEY, bot_username TEXT, token TEXT, create_time TEXT)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS pending_uploads
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, file_name TEXT,
-                      file_type TEXT, temp_path TEXT, created_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS clone_requests
+                     (user_id INTEGER PRIMARY KEY, bot_username TEXT, token TEXT,
+                      request_time TEXT, status TEXT DEFAULT 'pending')''')
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
              c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
@@ -160,19 +159,6 @@ def load_data():
                 user_files[user_id] = []
             user_files[user_id].append((file_name, file_type))
 
-        c.execute('SELECT id, user_id, file_name, file_type, temp_path, created_at FROM pending_uploads ORDER BY id')
-        for pending_id, p_user_id, p_file_name, p_file_type, p_temp_path, p_created_at in c.fetchall():
-            if os.path.exists(p_temp_path):
-                pending_uploads[pending_id] = {
-                    'user_id': p_user_id, 'file_name': p_file_name,
-                    'file_type': p_file_type, 'temp_path': p_temp_path,
-                    'created_at': p_created_at
-                }
-            else:
-                logger.warning(f"⚠️ Pending upload {pending_id} file missing; removing record.")
-                c.execute('DELETE FROM pending_uploads WHERE id = ?', (pending_id,))
-        conn.commit()
-
         c.execute('SELECT user_id FROM active_users')
         active_users.update(user_id for (user_id,) in c.fetchall())
 
@@ -190,6 +176,18 @@ def load_data():
                 logger.info(f"✅ Loaded clone bot @{bot_username} for user {user_id}")
             except ValueError:
                 logger.warning(f"⚠️ Invalid create_time for clone bot of user {user_id}")
+
+        c.execute("SELECT user_id, bot_username, token, request_time, status FROM clone_requests WHERE status = 'pending'")
+        for user_id, bot_username, token, request_time, status in c.fetchall():
+            try:
+                pending_clone_requests[user_id] = {
+                    'bot_username': bot_username,
+                    'token': token,
+                    'request_time': datetime.fromisoformat(request_time)
+                }
+                logger.info(f"🔔 Loaded pending clone request for user {user_id}, bot @{bot_username}")
+            except ValueError:
+                logger.warning(f"⚠️ Invalid request_time for clone request of user {user_id}")
 
         conn.close()
         logger.info(f"✅ Data loaded: 👥 {len(active_users)} users, 💳 {len(user_subscriptions)} subscriptions, 👑 {len(admin_ids)} admins, 🤖 {len(user_clones)} clones.")
@@ -217,6 +215,273 @@ def save_clone_info(user_id, bot_username, token):
             logger.error(f"❌ Unexpected error saving clone bot for {user_id}: {e}", exc_info=True)
         finally:
             conn.close()
+
+# ===== CLONE APPROVAL SYSTEM =====
+def save_clone_request(user_id, bot_username, token):
+    request_time = datetime.now()
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        try:
+            c.execute(
+                """INSERT OR REPLACE INTO clone_requests
+                   (user_id, bot_username, token, request_time, status)
+                   VALUES (?, ?, ?, ?, 'pending')""",
+                (user_id, bot_username, token, request_time.isoformat())
+            )
+            conn.commit()
+            pending_clone_requests[user_id] = {
+                'bot_username': bot_username,
+                'token': token,
+                'request_time': request_time
+            }
+            logger.info(f"🔔 Clone request saved for user {user_id}, bot @{bot_username}")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"❌ SQLite error saving clone request for {user_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Unexpected error saving clone request for {user_id}: {e}", exc_info=True)
+            return False
+        finally:
+            conn.close()
+
+
+def remove_clone_request(user_id, status='rejected'):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        try:
+            c.execute(
+                "UPDATE clone_requests SET status = ? WHERE user_id = ? AND status = 'pending'",
+                (status, user_id)
+            )
+            conn.commit()
+            pending_clone_requests.pop(user_id, None)
+            logger.info(f"🔔 Clone request {status} for user {user_id}")
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"❌ SQLite error updating clone request for {user_id}: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Unexpected error updating clone request for {user_id}: {e}", exc_info=True)
+            return False
+        finally:
+            conn.close()
+
+
+def create_clone_request_panel():
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    pending_items = list(pending_clone_requests.items())
+
+    if not pending_items:
+        markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="clone_requests"))
+        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+        return markup
+
+    for request_user_id, request_info in pending_items[:20]:
+        markup.add(types.InlineKeyboardButton(
+            f"🤖 @{request_info['bot_username']} | {request_user_id}",
+            callback_data=f"clone_req_view_{request_user_id}"
+        ))
+    markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="clone_requests"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="admin_panel"))
+    return markup
+
+
+def clone_requests_callback(call):
+    admin_id = call.from_user.id
+    if admin_id not in admin_ids:
+        bot.answer_callback_query(call.id, "⛔ Admin only.", show_alert=True)
+        return
+
+    pending_count = len(pending_clone_requests)
+    text_msg = (
+        "🔔 **Clone Approval Requests**\n\n"
+        f"Pending requests: **{pending_count}**\n\n"
+        "Select a request to approve or reject."
+    )
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        text_msg,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_clone_request_panel(),
+        parse_mode='Markdown'
+    )
+
+
+def clone_request_view_callback(call, request_user_id):
+    admin_id = call.from_user.id
+    if admin_id not in admin_ids:
+        bot.answer_callback_query(call.id, "⛔ Admin only.", show_alert=True)
+        return
+
+    try:
+        request_user_id = int(request_user_id)
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ Invalid request.", show_alert=True)
+        return
+
+    req = pending_clone_requests.get(request_user_id)
+    if not req:
+        bot.answer_callback_query(call.id, "⚠️ Request already processed.", show_alert=True)
+        clone_requests_callback(call)
+        return
+
+    request_time = req.get('request_time')
+    request_time_str = request_time.strftime('%Y-%m-%d %H:%M:%S') if request_time else 'Unknown'
+    text_msg = (
+        "🔔 **Clone Approval Request**\n\n"
+        f"👤 **User ID:** `{request_user_id}`\n"
+        f"🤖 **Bot:** @{req['bot_username']}\n"
+        f"🕒 **Requested:** `{request_time_str}`\n\n"
+        "Choose an action:"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("✅ Approve", callback_data=f"clone_approve_{request_user_id}"),
+        types.InlineKeyboardButton("❌ Reject", callback_data=f"clone_reject_{request_user_id}")
+    )
+    markup.add(types.InlineKeyboardButton("🔙 Requests", callback_data="clone_requests"))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        text_msg,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+
+def clone_approve_callback(call, request_user_id):
+    admin_id = call.from_user.id
+    if admin_id not in admin_ids:
+        bot.answer_callback_query(call.id, "⛔ Admin only.", show_alert=True)
+        return
+
+    try:
+        request_user_id = int(request_user_id)
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ Invalid request.", show_alert=True)
+        return
+
+    req = pending_clone_requests.get(request_user_id)
+    if not req:
+        bot.answer_callback_query(call.id, "⚠️ Request already processed.", show_alert=True)
+        clone_requests_callback(call)
+        return
+
+    if request_user_id in user_clones:
+        remove_clone_request(request_user_id, 'rejected')
+        bot.answer_callback_query(call.id, "⚠️ User already has a clone.", show_alert=True)
+        try:
+            bot.send_message(request_user_id, "⚠️ Your clone request was closed because you already have a clone bot.")
+        except Exception:
+            pass
+        clone_requests_callback(call)
+        return
+
+    bot.answer_callback_query(call.id, "⏳ Creating clone...")
+    try:
+        clone_success = create_bot_clone(
+            request_user_id,
+            req['token'],
+            req['bot_username']
+        )
+        if clone_success:
+            remove_clone_request(request_user_id, 'approved')
+            logger.info(f"✅ Clone request approved by admin {admin_id} for user {request_user_id}")
+            try:
+                bot.send_message(
+                    request_user_id,
+                    f"🎉 **Clone Approved!**\n\n"
+                    f"🤖 Bot: @{req['bot_username']}\n"
+                    f"🚀 Status: Running",
+                    parse_mode='Markdown'
+                )
+            except Exception as e:
+                logger.error(f"❌ Failed to notify clone approval to {request_user_id}: {e}")
+
+            bot.edit_message_text(
+                f"✅ **Clone Approved**\n\n"
+                f"👤 User: `{request_user_id}`\n"
+                f"🤖 Bot: @{req['bot_username']}\n"
+                f"🚀 Status: Running",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=create_clone_request_panel(),
+                parse_mode='Markdown'
+            )
+        else:
+            bot.edit_message_text(
+                "❌ **Clone creation failed.**\n\n"
+                "The request is still pending. Check Render logs and try again.",
+                call.message.chat.id,
+                call.message.message_id,
+                reply_markup=create_clone_request_panel(),
+                parse_mode='Markdown'
+            )
+            try:
+                bot.send_message(
+                    request_user_id,
+                    "⚠️ Your clone request could not be created right now. Please ask an admin to retry."
+                )
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"❌ Error approving clone request {request_user_id}: {e}", exc_info=True)
+        bot.edit_message_text(
+            f"❌ **Approval failed:** `{str(e).replace('`', "'")}`",
+            call.message.chat.id,
+            call.message.message_id,
+            reply_markup=create_clone_request_panel(),
+            parse_mode='Markdown'
+        )
+
+
+def clone_reject_callback(call, request_user_id):
+    admin_id = call.from_user.id
+    if admin_id not in admin_ids:
+        bot.answer_callback_query(call.id, "⛔ Admin only.", show_alert=True)
+        return
+
+    try:
+        request_user_id = int(request_user_id)
+    except ValueError:
+        bot.answer_callback_query(call.id, "❌ Invalid request.", show_alert=True)
+        return
+
+    req = pending_clone_requests.get(request_user_id)
+    if not req:
+        bot.answer_callback_query(call.id, "⚠️ Request already processed.", show_alert=True)
+        clone_requests_callback(call)
+        return
+
+    remove_clone_request(request_user_id, 'rejected')
+    logger.info(f"❌ Clone request rejected by admin {admin_id} for user {request_user_id}")
+    bot.answer_callback_query(call.id, "❌ Request rejected.")
+    try:
+        bot.send_message(
+            request_user_id,
+            f"❌ **Clone Request Rejected**\n\n"
+            f"🤖 Bot: @{req['bot_username']}\n"
+            "You can submit a new request later.",
+            parse_mode='Markdown'
+        )
+    except Exception as e:
+        logger.error(f"❌ Failed to notify rejected clone request to {request_user_id}: {e}")
+
+    bot.edit_message_text(
+        f"❌ **Clone Request Rejected**\n\n"
+        f"👤 User: `{request_user_id}`\n"
+        f"🤖 Bot: @{req['bot_username']}",
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_clone_request_panel(),
+        parse_mode='Markdown'
+    )
+
 
 # ===== REMOVE CLONE INFO =====
 def remove_clone_info(user_id):
@@ -858,197 +1123,6 @@ def create_control_buttons(script_owner_id, file_name, is_running=True):
     markup.add(types.InlineKeyboardButton("🔙 Back", callback_data='check_files'))
     return markup
 
-# ===== PENDING UPLOAD APPROVAL SYSTEM =====
-class ApprovalMessage:
-    def __init__(self, user_id):
-        self.from_user = type('ApprovalUser', (), {'id': user_id, 'first_name': 'User', 'last_name': ''})()
-        self.chat = type('ApprovalChat', (), {'id': user_id})()
-        self.message_id = 0
-
-
-def save_pending_upload(user_id, file_name, file_type, temp_path):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            created_at = datetime.now().isoformat()
-            c.execute('''INSERT INTO pending_uploads
-                         (user_id, file_name, file_type, temp_path, created_at)
-                         VALUES (?, ?, ?, ?, ?)''',
-                      (user_id, file_name, file_type, temp_path, created_at))
-            pending_id = c.lastrowid
-            conn.commit()
-            pending_uploads[pending_id] = {
-                'user_id': user_id, 'file_name': file_name, 'file_type': file_type,
-                'temp_path': temp_path, 'created_at': created_at
-            }
-            return pending_id
-        except Exception as e:
-            logger.error(f"❌ Error saving pending upload for {user_id}: {e}", exc_info=True)
-            return None
-        finally:
-            conn.close()
-
-
-def remove_pending_upload(pending_id):
-    with DB_LOCK:
-        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
-        c = conn.cursor()
-        try:
-            c.execute('DELETE FROM pending_uploads WHERE id = ?', (pending_id,))
-            conn.commit()
-            return pending_uploads.pop(pending_id, None)
-        except Exception as e:
-            logger.error(f"❌ Error removing pending upload {pending_id}: {e}", exc_info=True)
-            return None
-        finally:
-            conn.close()
-
-
-def create_pending_approval_markup(pending_id):
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton('✅ Approve', callback_data=f'approve_upload_{pending_id}'),
-        types.InlineKeyboardButton('❌ Reject', callback_data=f'reject_upload_{pending_id}')
-    )
-    return markup
-
-
-def pending_approvals_callback(call):
-    admin_id = call.from_user.id
-    if admin_id not in admin_ids:
-        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
-        return
-    bot.answer_callback_query(call.id)
-    if not pending_uploads:
-        bot.edit_message_text('📥 Pending Approvals\n\nNo files waiting for approval.',
-                              call.message.chat.id, call.message.message_id,
-                              reply_markup=create_admin_panel())
-        return
-    lines = ['📥 Pending Approvals', '']
-    for pending_id, info in list(sorted(pending_uploads.items()))[:30]:
-        lines.append(f"#{pending_id} — `{info['file_name']}` ({info['file_type'].upper()})\n👤 User: `{info['user_id']}`")
-    if len(pending_uploads) > 30:
-        lines.append(f"\n…and {len(pending_uploads) - 30} more.")
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    for pending_id, info in list(sorted(pending_uploads.items()))[:30]:
-        markup.add(types.InlineKeyboardButton(
-            f"#{pending_id} • {info['file_name']} • User {info['user_id']}",
-            callback_data=f'pending_view_{pending_id}'
-        ))
-    markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel_back'))
-    bot.edit_message_text('\n'.join(lines), call.message.chat.id, call.message.message_id,
-                          reply_markup=markup, parse_mode='Markdown')
-
-
-def pending_view_callback(call, pending_id):
-    if call.from_user.id not in admin_ids:
-        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
-        return
-    info = pending_uploads.get(pending_id)
-    if not info:
-        bot.answer_callback_query(call.id, '❓ Approval request not found.', show_alert=True)
-        pending_approvals_callback(call)
-        return
-    bot.answer_callback_query(call.id)
-    text = (f"📥 **File Approval Request**\n\n"
-            f"🆔 Request: `{pending_id}`\n"
-            f"👤 User ID: `{info['user_id']}`\n"
-            f"📄 File: `{info['file_name']}`\n"
-            f"📦 Type: `{info['file_type'].upper()}`\n"
-            f"🕒 Submitted: `{info['created_at']}`\n\n"
-            f"Choose an action:")
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                          reply_markup=create_pending_approval_markup(pending_id), parse_mode='Markdown')
-
-
-def approve_pending_upload(call, pending_id):
-    if call.from_user.id not in admin_ids:
-        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
-        return
-    info = pending_uploads.get(pending_id)
-    if not info:
-        bot.answer_callback_query(call.id, '❓ Approval request already handled.', show_alert=True)
-        return
-    temp_path = info['temp_path']
-    if not os.path.exists(temp_path):
-        remove_pending_upload(pending_id)
-        bot.answer_callback_query(call.id, '❌ Pending file is missing.', show_alert=True)
-        bot.send_message(info['user_id'], f"❌ Your file `{info['file_name']}` could not be approved because the stored file is missing. Please upload again.", parse_mode='Markdown')
-        return
-
-    user_id = info['user_id']
-    file_name = info['file_name']
-    file_type = info['file_type']
-    try:
-        if get_user_file_count(user_id) >= get_user_file_limit(user_id):
-            bot.answer_callback_query(call.id, '⚠️ User file limit reached.', show_alert=True)
-            bot.send_message(user_id, f"⚠️ Your file limit is full. `{file_name}` was not approved. Delete a file and upload again.", parse_mode='Markdown')
-            return
-
-        if file_type == 'zip':
-            with open(temp_path, 'rb') as f:
-                content = f.read()
-            remove_pending_upload(pending_id)
-            os.remove(temp_path)
-            proxy = ApprovalMessage(user_id)
-            bot.answer_callback_query(call.id, '✅ Approved. Processing ZIP...')
-            bot.send_message(user_id, f"✅ Your ZIP `{file_name}` was approved by admin. Processing now...", parse_mode='Markdown')
-            handle_zip_file(content, file_name, proxy)
-        else:
-            user_folder = get_user_folder(user_id)
-            file_path = os.path.join(user_folder, file_name)
-            shutil.move(temp_path, file_path)
-            remove_pending_upload(pending_id)
-            save_user_file(user_id, file_name, file_type)
-            bot.answer_callback_query(call.id, '✅ File approved.')
-            bot.send_message(user_id, f"✅ Your file `{file_name}` was approved by admin and is starting now.", parse_mode='Markdown')
-            if file_type == 'py':
-                threading.Thread(target=run_script, args=(file_path, user_id, user_folder, file_name, ApprovalMessage(user_id))).start()
-            elif file_type == 'js':
-                threading.Thread(target=run_js_script, args=(file_path, user_id, user_folder, file_name, ApprovalMessage(user_id))).start()
-        logger.info(f"✅ Pending upload #{pending_id} approved by admin {call.from_user.id} for user {user_id}: {file_name}")
-        try:
-            bot.edit_message_text(f"✅ Approved: `{file_name}` for User `{user_id}`.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
-        except Exception:
-            pass
-    except Exception as e:
-        logger.error(f"❌ Error approving pending upload #{pending_id}: {e}", exc_info=True)
-        bot.answer_callback_query(call.id, '❌ Approval failed. Check logs.', show_alert=True)
-        bot.send_message(user_id, f"⚠️ Approval of `{file_name}` failed. Please contact admin.", parse_mode='Markdown')
-
-
-def reject_pending_upload(call, pending_id):
-    if call.from_user.id not in admin_ids:
-        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
-        return
-    info = pending_uploads.get(pending_id)
-    if not info:
-        bot.answer_callback_query(call.id, '❓ Approval request already handled.', show_alert=True)
-        return
-    removed = remove_pending_upload(pending_id)
-    try:
-        if removed and os.path.exists(removed['temp_path']):
-            os.remove(removed['temp_path'])
-    except Exception as e:
-        logger.error(f"❌ Failed deleting rejected pending file #{pending_id}: {e}")
-    bot.answer_callback_query(call.id, '❌ File rejected.')
-    bot.send_message(info['user_id'], f"❌ Your file `{info['file_name']}` was rejected by admin.", parse_mode='Markdown')
-    logger.info(f"❌ Pending upload #{pending_id} rejected by admin {call.from_user.id} for user {info['user_id']}: {info['file_name']}")
-    try:
-        bot.edit_message_text(f"❌ Rejected: `{info['file_name']}` for User `{info['user_id']}`.", call.message.chat.id, call.message.message_id, parse_mode='Markdown')
-    except Exception:
-        pass
-
-
-def admin_panel_back_callback(call):
-    if call.from_user.id not in admin_ids:
-        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
-        return
-    bot.answer_callback_query(call.id)
-    bot.edit_message_text('👑 Admin Panel\nManage admins and pending uploads.', call.message.chat.id,
-                          call.message.message_id, reply_markup=create_admin_panel())
-
 # ===== CREATE ADMIN PANEL =====
 def create_admin_panel():
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -1057,7 +1131,7 @@ def create_admin_panel():
         types.InlineKeyboardButton('➖ Remove', callback_data='remove_admin')
     )
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
-    markup.row(types.InlineKeyboardButton('📥 Pending Approvals', callback_data='pending_approvals'))
+    markup.row(types.InlineKeyboardButton('🔔 Clone Requests', callback_data='clone_requests'))
     markup.row(types.InlineKeyboardButton('🔙 Back', callback_data='back_to_main'))
     return markup
 
@@ -1588,59 +1662,26 @@ def handle_file_upload_doc(message):
         bot.reply_to(message, f"⚠️ File too large (Max: {max_file_size // 1024 // 1024} MB)."); return
 
     try:
+        try:
+            bot.forward_message(OWNER_ID, chat_id, message.message_id)
+            bot.send_message(OWNER_ID, f"📎 File '{file_name}' from {message.from_user.first_name} {message.from_user.last_name or ''} (`{user_id}`)", parse_mode='Markdown')
+        except Exception as e: logger.error(f"❌ Failed to forward uploaded file to OWNER_ID {OWNER_ID}: {e}")
+
         download_wait_msg = bot.reply_to(message, f"⏳ Downloading `{file_name}`...")
         file_info_tg_doc = bot.get_file(doc.file_id)
         downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
-        bot.edit_message_text(f"✅ Downloaded `{file_name}`. Sending for admin approval...", chat_id, download_wait_msg.message_id)
+        bot.edit_message_text(f"✅ Downloaded `{file_name}`. Processing...", chat_id, download_wait_msg.message_id)
         logger.info(f"✅ Downloaded {file_name} for user {user_id}")
+        user_folder = get_user_folder(user_id)
 
-        # Owner/Admin uploads continue immediately; normal users require approval.
-        if user_id in admin_ids:
-            user_folder = get_user_folder(user_id)
-            if file_ext == '.zip':
-                handle_zip_file(downloaded_file_content, file_name, message)
-            else:
-                file_path = os.path.join(user_folder, file_name)
-                with open(file_path, 'wb') as f: f.write(downloaded_file_content)
-                logger.info(f"💾 Saved admin file to {file_path}")
-                if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
-                elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
-            return
-
-        pending_dir = os.path.join(IROTECH_DIR, 'pending_uploads')
-        os.makedirs(pending_dir, exist_ok=True)
-        safe_name = re.sub(r'[^A-Za-z0-9._-]', '_', file_name)
-        temp_path = os.path.join(pending_dir, f"{user_id}_{int(time.time() * 1000)}_{safe_name}")
-        with open(temp_path, 'wb') as f:
-            f.write(downloaded_file_content)
-        pending_id = save_pending_upload(user_id, file_name, file_ext.lstrip('.'), temp_path)
-        if not pending_id:
-            os.remove(temp_path)
-            bot.reply_to(message, '❌ Could not create approval request. Please try again.')
-            return
-
-        approval_text = (f"📥 **New File Approval Request**\n\n"
-                         f"🆔 Request: `{pending_id}`\n"
-                         f"👤 Name: {message.from_user.first_name} {message.from_user.last_name or ''}\n"
-                         f"📱 Username: @{message.from_user.username or 'N/A'}\n"
-                         f"🆔 User ID: `{user_id}`\n"
-                         f"📄 File: `{file_name}`\n"
-                         f"📦 Type: `{file_ext.lstrip('.').upper()}`\n\n"
-                         f"⏳ Waiting for admin approval.")
-        # Send approval controls to every configured admin.
-        for admin_id in list(admin_ids):
-            try:
-                bot.send_message(admin_id, approval_text, reply_markup=create_pending_approval_markup(pending_id), parse_mode='Markdown')
-                if admin_id == OWNER_ID:
-                    try:
-                        bot.forward_message(OWNER_ID, chat_id, message.message_id)
-                    except Exception as e:
-                        logger.error(f"❌ Failed to forward pending file to OWNER_ID: {e}")
-            except Exception as e:
-                logger.error(f"❌ Failed to notify admin {admin_id} about pending upload #{pending_id}: {e}")
-
-        bot.send_message(chat_id, f"⏳ Your file `{file_name}` has been submitted for admin approval. You will be notified after approval.", parse_mode='Markdown')
-        logger.info(f"📥 Pending upload #{pending_id} created for user {user_id}: {file_name}")
+        if file_ext == '.zip':
+            handle_zip_file(downloaded_file_content, file_name, message)
+        else:
+            file_path = os.path.join(user_folder, file_name)
+            with open(file_path, 'wb') as f: f.write(downloaded_file_content)
+            logger.info(f"💾 Saved single file to {file_path}")
+            if file_ext == '.js': handle_js_file(file_path, user_id, user_folder, file_name, message)
+            elif file_ext == '.py': handle_py_file(file_path, user_id, user_folder, file_name, message)
     except telebot.apihelper.ApiTelegramException as e:
          logger.error(f"❌ Telegram API Error handling file for {user_id}: {e}", exc_info=True)
          if "file is too big" in str(e).lower():
@@ -1689,16 +1730,6 @@ def handle_callbacks(call):
             owner_required_callback(call, remove_admin_init_callback)
         elif data == 'list_admins':
             admin_required_callback(call, list_admins_callback)
-        elif data == 'pending_approvals':
-            admin_required_callback(call, pending_approvals_callback)
-        elif data == 'admin_panel_back':
-            admin_required_callback(call, admin_panel_back_callback)
-        elif data.startswith('pending_view_'):
-            admin_required_callback(call, lambda c: pending_view_callback(c, int(c.data.split('_', 2)[2])))
-        elif data.startswith('approve_upload_'):
-            admin_required_callback(call, lambda c: approve_pending_upload(c, int(c.data.split('_', 2)[2])))
-        elif data.startswith('reject_upload_'):
-            admin_required_callback(call, lambda c: reject_pending_upload(c, int(c.data.split('_', 2)[2])))
         elif data == 'add_subscription':
             admin_required_callback(call, add_subscription_init_callback)
         elif data == 'remove_subscription':
@@ -1707,6 +1738,14 @@ def handle_callbacks(call):
             admin_required_callback(call, list_subscriptions_callback)
         elif data == 'clone_create':
             clone_create_callback(call)
+        elif data == 'clone_requests':
+            admin_required_callback(call, clone_requests_callback)
+        elif data.startswith('clone_req_view_'):
+            admin_required_callback(call, lambda c: clone_request_view_callback(c, data[len('clone_req_view_'):]))
+        elif data.startswith('clone_approve_'):
+            admin_required_callback(call, lambda c: clone_approve_callback(c, data[len('clone_approve_'):]))
+        elif data.startswith('clone_reject_'):
+            admin_required_callback(call, lambda c: clone_reject_callback(c, data[len('clone_reject_'):]))
         elif data == 'clone_remove':
             clone_remove_callback(call)
         elif data == 'clone_remove_confirm':
@@ -2560,78 +2599,103 @@ def clone_remove_confirm_callback(call):
 # ===== HANDLE TOKEN INPUT =====
 def handle_token_input(message, original_chat_id, original_message_id):
     user_id = message.from_user.id
-    
-    if message.text == '/cancel':
+
+    if message.text and message.text.strip().lower() == '/cancel':
         _logic_clone_bot(message)
         return
-    
-    token = message.text.strip()
-    
+
+    token = (message.text or '').strip()
+
     if not token or len(token) < 35 or ':' not in token:
-        error_msg = f"**❌ Invalid bot token!** \n\n"
-        error_msg += f"Please send a valid bot token from @BotFather \n"
-        error_msg += f"Format: `1234567890:ABCdefGHi`\n"
-        error_msg += f"`jklMnOpqrstUvWxyz` \n\n"
-        
+        error_msg = (
+            "**❌ Invalid bot token!**\n\n"
+            "Please send a valid bot token from @BotFather\n"
+            "Format: `1234567890:ABCdefGHi`\n"
+            "`jklMnOpqrstUvWxyz`\n\n"
+            "Send /cancel to abort."
+        )
         markup = types.InlineKeyboardMarkup()
         markup.row(types.InlineKeyboardButton("❌ Cancel", callback_data="back_to_main"))
-        
-        bot.reply_to(
-            message,
-            error_msg,
-            reply_markup=markup,
-            parse_mode="Markdown"
-        )
+        bot.reply_to(message, error_msg, reply_markup=markup, parse_mode="Markdown")
         return
-    
-    processing_msg = bot.reply_to(
-        message, 
-        "🔄 Creating your bot clone...\n\nThis may take a moment..."
-    )
-    
+
+    if user_id in pending_clone_requests:
+        bot.reply_to(message, "⏳ You already have a clone request waiting for admin approval.")
+        return
+
+    if user_id in user_clones:
+        bot.reply_to(message, f"⚠️ You already have a clone bot: @{user_clones[user_id]['bot_username']}")
+        return
+
+    processing_msg = bot.reply_to(message, "🔍 Validating your bot token...")
+
     try:
         test_bot = telebot.TeleBot(token)
         bot_info = test_bot.get_me()
-        
+
+        if not bot_info.username:
+            raise ValueError("Telegram did not return a bot username.")
+
+        if not save_clone_request(user_id, bot_info.username, token):
+            raise RuntimeError("Could not save clone approval request.")
+
         bot.edit_message_text(
-            f"✅ Token validated!\n\nBot: @{bot_info.username}\nCreating clone...",
-            processing_msg.chat.id,
-            processing_msg.message_id
-        )
-        
-        clone_success = create_bot_clone(user_id, token, bot_info.username)
-        
-        if clone_success:
-            success_msg = f"**🎉 Bot Clone Created!** \n\n"
-            success_msg += f"**🤖 Bot Name:** @{bot_info.username} \n"
-            success_msg += f"**🚀 Status:** Running \n"
-            success_msg += f"**🔗 Features:** All Universal File Host \n"
-            success_msg += f"**🛡️ Protection:** Auto-restart On \n\n"
-            success_msg += f"**✨ Unlimited clones available**"
-            
-            bot.edit_message_text(
-                success_msg,
-                processing_msg.chat.id,
-                processing_msg.message_id,
-                parse_mode="Markdown"
-            )
-        else:
-            bot.edit_message_text(
-                "❌ Failed to create bot clone. Please try again later.",
-                processing_msg.chat.id,
-                processing_msg.message_id
-            )
-    except Exception as e:
-        error_msg = f"**❌ Bot Clone Failed** \n\n"
-        error_msg += f"Error: `{str(e)}` \n\n"
-        error_msg += f"💡 Make sure your token is valid and try again"
-        
-        bot.edit_message_text(
-            error_msg,
+            f"🔔 **Approval Requested!**\n\n"
+            f"🤖 Bot: @{bot_info.username}\n"
+            f"👤 User ID: `{user_id}`\n\n"
+            "⏳ Your clone request has been sent to the admin for approval.\n"
+            "You will be notified after it is approved or rejected.",
             processing_msg.chat.id,
             processing_msg.message_id,
             parse_mode="Markdown"
         )
+
+        admin_markup = types.InlineKeyboardMarkup(row_width=2)
+        admin_markup.row(
+            types.InlineKeyboardButton("🔎 Review", callback_data=f"clone_req_view_{user_id}"),
+            types.InlineKeyboardButton("❌ Reject", callback_data=f"clone_reject_{user_id}")
+        )
+        admin_text = (
+            "🔔 **New Clone Approval Request**\n\n"
+            f"👤 User ID: `{user_id}`\n"
+            f"🤖 Bot: @{bot_info.username}\n"
+            f"🕒 Time: `{datetime.now():%Y-%m-%d %H:%M:%S}`\n\n"
+            "Review this request from the Admin Panel."
+        )
+
+        notified = 0
+        for admin_id in list(admin_ids):
+            try:
+                bot.send_message(admin_id, admin_text, reply_markup=admin_markup, parse_mode="Markdown")
+                notified += 1
+            except Exception as e:
+                logger.error(f"❌ Failed to notify admin {admin_id} about clone request: {e}")
+
+        logger.info(
+            f"🔔 Clone approval requested by {user_id} for @{bot_info.username}; "
+            f"admins notified: {notified}"
+        )
+
+    except telebot.apihelper.ApiTelegramException as e:
+        safe_error = str(e).replace("`", "'")
+        bot.edit_message_text(
+            f"❌ **Bot Clone Request Failed**\n\n"
+            f"Error: {safe_error}\n\n"
+            "💡 Make sure your token is valid and try again.",
+            processing_msg.chat.id,
+            processing_msg.message_id,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        safe_error = str(e).replace("`", "'")
+        logger.error(f"❌ Error creating clone approval request for {user_id}: {e}", exc_info=True)
+        bot.edit_message_text(
+            f"❌ **Bot Clone Request Failed**\n\nError: {safe_error}",
+            processing_msg.chat.id,
+            processing_msg.message_id,
+            parse_mode="Markdown"
+        )
+
 
 # ===== CLEANUP FUNCTION =====
 def cleanup():

@@ -1998,23 +1998,155 @@ def _logic_run_all_scripts(message):
     logger.info(f"✅ Run all scripts finished. Admin: {admin_user_id}. Started: {started_count}. Skipped/Errors: {skipped_files}")
 
 # ==== LOGIC: CLONE BOT =====
+def create_user_clone_control_panel(user_id):
+    """Create the clone controls shown to the clone owner from the user menu."""
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    info = user_clones.get(int(user_id))
+    if not info:
+        markup.row(
+            types.InlineKeyboardButton("🚀 Create Clone", callback_data="clone_create"),
+            types.InlineKeyboardButton("🔄 Refresh", callback_data="user_clone_controls")
+        )
+        markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_main"))
+        return markup
+
+    running = clone_status(user_id)
+    if running:
+        markup.row(
+            types.InlineKeyboardButton("🛑 Stop", callback_data="user_clone_stop"),
+            types.InlineKeyboardButton("🔄 Restart", callback_data="user_clone_restart")
+        )
+    else:
+        markup.row(
+            types.InlineKeyboardButton("▶️ Start", callback_data="user_clone_start"),
+            types.InlineKeyboardButton("🔄 Restart", callback_data="user_clone_restart")
+        )
+    markup.row(
+        types.InlineKeyboardButton("🗑️ Remove", callback_data="clone_remove"),
+        types.InlineKeyboardButton("🔄 Refresh", callback_data="user_clone_controls")
+    )
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_main"))
+    return markup
+
+
+def user_clone_controls_callback(call):
+    """Show the current user's own clone controls."""
+    user_id = call.from_user.id
+    info = user_clones.get(user_id)
+    if not info:
+        bot.answer_callback_query(call.id, "ℹ️ You don't have a clone bot yet.", show_alert=True)
+        return _logic_clone_bot(call.message)
+
+    running = clone_status(user_id)
+    status = "🟢 Running" if running else "🔴 Stopped"
+    text = (
+        "🤖 Your Clone Bot\n\n"
+        f"🤖 Bot: @{info['bot_username']}\n"
+        f"📊 Status: {status}\n\n"
+        "Choose an action:"
+    )
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        text, call.message.chat.id, call.message.message_id,
+        reply_markup=create_user_clone_control_panel(user_id)
+    )
+
+
+def user_clone_start_callback(call):
+    user_id = call.from_user.id
+    info = user_clones.get(user_id)
+    if not info:
+        bot.answer_callback_query(call.id, "⚠️ No clone bot found.", show_alert=True)
+        return
+    if clone_status(user_id):
+        bot.answer_callback_query(call.id, "🟢 Clone already running.", show_alert=True)
+    else:
+        bot.answer_callback_query(call.id, "🚀 Starting clone...")
+        ok = create_bot_clone(user_id, info['token'], info['bot_username'])
+        if not ok:
+            bot.answer_callback_query(call.id, "❌ Clone failed to start. Check logs.", show_alert=True)
+            return user_clone_controls_callback(call)
+    user_clone_controls_callback(call)
+
+
+def user_clone_stop_callback(call):
+    user_id = call.from_user.id
+    info = user_clones.get(user_id)
+    if not info:
+        bot.answer_callback_query(call.id, "⚠️ No clone bot found.", show_alert=True)
+        return
+    proc = get_clone_process(user_id)
+    if proc is None:
+        bot.answer_callback_query(call.id, "🔴 Clone is already stopped.", show_alert=True)
+    else:
+        try:
+            kill_process_tree(proc)
+        except Exception as e:
+            logger.error(f"❌ Error stopping user clone {user_id}: {e}", exc_info=True)
+        clone_processes.pop(user_id, None)
+        handle = clone_log_handles.pop(user_id, None)
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        bot.answer_callback_query(call.id, "🛑 Clone stopped.")
+    user_clone_controls_callback(call)
+
+
+def user_clone_restart_callback(call):
+    user_id = call.from_user.id
+    info = user_clones.get(user_id)
+    if not info:
+        bot.answer_callback_query(call.id, "⚠️ No clone bot found.", show_alert=True)
+        return
+    proc = get_clone_process(user_id)
+    if proc is not None:
+        try:
+            kill_process_tree(proc)
+        except Exception as e:
+            logger.error(f"❌ Error stopping user clone {user_id} for restart: {e}", exc_info=True)
+        clone_processes.pop(user_id, None)
+        handle = clone_log_handles.pop(user_id, None)
+        if handle:
+            try:
+                handle.close()
+            except Exception:
+                pass
+        time.sleep(1)
+    bot.answer_callback_query(call.id, "🔄 Restarting clone...")
+    ok = create_bot_clone(user_id, info['token'], info['bot_username'])
+    if not ok:
+        bot.answer_callback_query(call.id, "❌ Clone restart failed. Check logs.", show_alert=True)
+    user_clone_controls_callback(call)
+
+
 def _logic_clone_bot(message):
     user_id = message.from_user.id
-    
-    clone_text = f"🤖 Clone Bot Service\n\n"
-    clone_text += f"📊 Total Clones: {len(user_clones)}\n\n"
-    clone_text += f"🎯 Features in your clone:\n"
-    clone_text += f"• 📁 Unlimited file hosting\n"
-    clone_text += f"• 🛡️ Security scanning\n"
-    clone_text += f"• 💾 File hosting\n"
-    clone_text += f"• ⚡ Auto-restart\n\n"
-    
-    markup = types.InlineKeyboardMarkup(row_width=2)
-    markup.row(
-        types.InlineKeyboardButton("🚀 Clone", callback_data="clone_create"),
-        types.InlineKeyboardButton("🗑️ Remove", callback_data="clone_remove")
-    )
-    
+    info = user_clones.get(user_id)
+
+    if info:
+        running = clone_status(user_id)
+        status = "🟢 Running" if running else "🔴 Stopped"
+        clone_text = (
+            "🤖 Your Clone Bot\n\n"
+            f"🤖 Bot: @{info['bot_username']}\n"
+            f"📊 Status: {status}\n\n"
+            "🎯 Clone controls:"
+        )
+        markup = create_user_clone_control_panel(user_id)
+    else:
+        clone_text = (
+            "🤖 Clone Bot Service\n\n"
+            f"📊 Total Clones: {len(user_clones)}\n\n"
+            "🎯 Features in your clone:\n"
+            "• 📁 Unlimited file hosting\n"
+            "• 🛡️ Security scanning\n"
+            "• 💾 File hosting\n"
+            "• ⚡ Auto-restart\n\n"
+        )
+        markup = create_user_clone_control_panel(user_id)
+
     bot.reply_to(message, clone_text, reply_markup=markup, parse_mode="Markdown")
 
 # ===== MESSAGE HANDLERS =====
@@ -2221,6 +2353,14 @@ def handle_callbacks(call):
         elif data.startswith('clone_ban_'):
             clone_user_id = data.split('_')[-1]
             admin_required_callback(call, lambda c: clone_ban_callback(c, clone_user_id))
+        elif data == 'user_clone_controls':
+            user_clone_controls_callback(call)
+        elif data == 'user_clone_start':
+            user_clone_start_callback(call)
+        elif data == 'user_clone_stop':
+            user_clone_stop_callback(call)
+        elif data == 'user_clone_restart':
+            user_clone_restart_callback(call)
         elif data == 'clone_create':
             clone_create_callback(call)
         elif data == 'clone_requests':

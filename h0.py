@@ -2892,12 +2892,12 @@ def clone_remove_callback(call):
     )
     
     bot.edit_message_text(
-        f"🗑️ **Remove Clone Bot** \n\n"
-        f"⚠️ Remove your clone bot? \n\n"
+        "🗑️ Remove Clone Bot\n\n"
+        "⚠️ Remove your clone bot?\n\n"
         f"🤖 Bot Name @{bot_username}\n"
-        f"🚀 Will be removed",
+        "🚀 Will be removed",
         chat_id, message_id,
-        reply_markup=markup, parse_mode="Markdown"
+        reply_markup=markup
     )
     bot.answer_callback_query(call.id)
 
@@ -2913,23 +2913,35 @@ def clone_remove_confirm_callback(call):
     
     bot_username = user_clones[user_id]['bot_username']
     
+    proc = get_clone_process(user_id)
+    if proc is not None:
+        try:
+            kill_process_tree(proc)
+        except Exception as e:
+            logger.error(f"❌ Error stopping clone {user_id} during removal: {e}", exc_info=True)
+        clone_processes.pop(user_id, None)
+        handle = clone_log_handles.pop(user_id, None)
+        if handle:
+            try: handle.close()
+            except Exception: pass
+
     clone_dir = os.path.join(BASE_DIR, f'clone_{user_id}')
     if os.path.exists(clone_dir):
         try:
             shutil.rmtree(clone_dir)
         except Exception as e:
             logger.error(f"❌ Error removing clone directory for {user_id}: {e}")
-    
+
     remove_clone_info(user_id)
     
     bot.answer_callback_query(call.id)
     
     bot.edit_message_text(
-        f"✅ **Clone Bot Removed!** \n\n"
+        "✅ Clone Bot Removed!\n\n"
         f"🤖 Bot @{bot_username}\n"
-        f"🗑️ Successfully removed",
+        "🗑️ Successfully removed",
         chat_id, message_id,
-        reply_markup=None, parse_mode="Markdown"
+        reply_markup=None
     )
 
 # ===== HANDLE TOKEN INPUT =====
@@ -2987,7 +2999,6 @@ def handle_token_input(message, original_chat_id, original_message_id):
             "You will be notified after it is approved or rejected.",
             processing_msg.chat.id,
             processing_msg.message_id,
-            parse_mode="Markdown"
         )
 
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2996,17 +3007,17 @@ def handle_token_input(message, original_chat_id, original_message_id):
             types.InlineKeyboardButton("❌ Reject", callback_data=f"clone_reject_{user_id}")
         )
         admin_text = (
-            "🔔 **New Clone Approval Request**\n\n"
-            f"👤 User ID: `{user_id}`\n"
+            "🔔 New Clone Approval Request\n\n"
+            f"👤 User ID: {user_id}\n"
             f"🤖 Bot: @{bot_info.username}\n"
-            f"🕒 Time: `{datetime.now():%Y-%m-%d %H:%M:%S}`\n\n"
+            f"🕒 Time: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
             "Review this request from the Admin Panel."
         )
 
         notified = 0
         for admin_id in list(admin_ids):
             try:
-                bot.send_message(admin_id, admin_text, reply_markup=admin_markup, parse_mode="Markdown")
+                bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
                 notified += 1
             except Exception as e:
                 logger.error(f"❌ Failed to notify admin {admin_id} about clone request: {e}")
@@ -3024,16 +3035,14 @@ def handle_token_input(message, original_chat_id, original_message_id):
             "💡 Make sure your token is valid and try again.",
             processing_msg.chat.id,
             processing_msg.message_id,
-            parse_mode="Markdown"
         )
     except Exception as e:
         safe_error = str(e).replace("`", "'")
         logger.error(f"❌ Error creating clone approval request for {user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ **Bot Clone Request Failed**\n\nError: {safe_error}",
+            f"❌ Bot Clone Request Failed\n\nError: {safe_error}",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
 
 

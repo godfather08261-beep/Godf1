@@ -5,6 +5,7 @@ import zipfile
 import tempfile
 import shutil
 from telebot import types
+from types import SimpleNamespace
 import time
 from datetime import datetime, timedelta
 import psutil
@@ -406,16 +407,16 @@ def file_request_approve_callback(call, request_id):
             with open(file_path, 'rb') as f:
                 content = f.read()
             update_file_request_status(request_id, 'approved')
-            handle_zip_file(content, file_name, types.SimpleNamespace(from_user=types.SimpleNamespace(id=user_id), chat=types.SimpleNamespace(id=user_id), message_id=call.message.message_id))
+            handle_zip_file(content, file_name, SimpleNamespace(from_user=SimpleNamespace(id=user_id), chat=SimpleNamespace(id=user_id), message_id=call.message.message_id))
         else:
             final_path = os.path.join(user_folder, file_name)
             if os.path.exists(final_path):
                 os.remove(final_path)
             shutil.move(file_path, final_path)
             update_file_request_status(request_id, 'approved')
-            fake_message = types.SimpleNamespace(
-                from_user=types.SimpleNamespace(id=user_id),
-                chat=types.SimpleNamespace(id=user_id),
+            fake_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=user_id),
+                chat=SimpleNamespace(id=user_id),
                 message_id=call.message.message_id
             )
             if req['file_type'] == 'py':
@@ -2579,16 +2580,51 @@ def handle_file_upload_doc(message):
                 f'📦 Type: {file_type}\n'
                 f'🆔 Request ID: {request_id}\n'
                 f'🕒 Time: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n'
-                'Review from Admin Panel.'
+                'Review this request below.'
             )
+
+            # Always send the actual uploaded file to the OWNER for review.
+            # No Markdown parse mode is used here so filenames containing
+            # underscores, brackets, or other Telegram markup characters cannot
+            # break the message.
+            owner_notified = False
+            try:
+                with open(pending_path, 'rb') as pending_file:
+                    bot.send_document(
+                        OWNER_ID,
+                        pending_file,
+                        caption=admin_text,
+                        reply_markup=admin_markup
+                    )
+                owner_notified = True
+                logger.info(f'📎 Pending file {request_id} sent to OWNER_ID {OWNER_ID}.')
+            except Exception as e:
+                logger.error(
+                    f'❌ Failed to send uploaded file request {request_id} to OWNER_ID {OWNER_ID}: {e}',
+                    exc_info=True
+                )
+
+            # Keep notifying configured admins too, but do not send the same
+            # document repeatedly to the owner if OWNER_ID is already an admin.
             notified = 0
             for admin_id in list(admin_ids):
+                if admin_id == OWNER_ID:
+                    continue
                 try:
                     bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
                     notified += 1
                 except Exception as e:
                     logger.error(f'❌ Failed to notify admin {admin_id} about file request {request_id}: {e}')
-            logger.info(f'📥 File approval request {request_id} created; admins notified: {notified}')
+
+            if not owner_notified:
+                # The request remains pending in the database so it can be
+                # reviewed from Admin Panel even if the owner notification failed.
+                logger.warning(f'⚠️ Owner notification failed for file request {request_id}; request remains pending.')
+
+            logger.info(
+                f'📥 File approval request {request_id} created; '
+                f'owner_notified={owner_notified}, other_admins_notified={notified}'
+            )
             return
         except telebot.apihelper.ApiTelegramException as e:
             logger.error(f'❌ Telegram API error creating file request for {user_id}: {e}', exc_info=True)

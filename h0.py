@@ -191,7 +191,7 @@ def load_data():
                 logger.warning(f"⚠️ Invalid request_time for clone request of user {user_id}")
 
         conn.close()
-        logger.info(f"✅ Data loaded: 👥 {len(active_users)} users, 💳 {len(user_subscriptions)} subscriptions, 👑 {len(admin_ids)} admins, 🤖 {len(user_clones)} clones.")
+        logger.info(f"✅ Data loaded: 👥 {len(active_users)} users, 💳 {len(user_subscriptions)} subscriptions, 👑 {len(admin_ids)} admins, 🤖 {len(user_clones)} clones, 🔔 {len(pending_clone_requests)} pending clone requests.")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
 
@@ -295,6 +295,26 @@ def clone_requests_callback(call):
     if admin_id not in admin_ids:
         bot.answer_callback_query(call.id, "⛔ Admin only.", show_alert=True)
         return
+
+    # Refresh pending requests from SQLite so approval requests survive restarts
+    # and are visible even if the in-memory cache was empty.
+    try:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        c.execute("SELECT user_id, bot_username, token, request_time FROM clone_requests WHERE status = 'pending'")
+        pending_clone_requests.clear()
+        for request_user_id, bot_username, token, request_time in c.fetchall():
+            try:
+                pending_clone_requests[int(request_user_id)] = {
+                    'bot_username': bot_username,
+                    'token': token,
+                    'request_time': datetime.fromisoformat(request_time)
+                }
+            except (ValueError, TypeError):
+                logger.warning(f"⚠️ Invalid request_time for clone request of user {request_user_id}")
+        conn.close()
+    except Exception as e:
+        logger.error(f"❌ Failed to refresh clone requests: {e}", exc_info=True)
 
     pending_count = len(pending_clone_requests)
     text_msg = (
@@ -411,7 +431,8 @@ def clone_approve_callback(call, request_user_id):
                 f"🚀 Status: Running",
                 call.message.chat.id,
                 call.message.message_id,
-                reply_markup=create_clone_request_panel()
+                reply_markup=create_clone_request_panel(),
+                parse_mode='Markdown'
             )
         else:
             bot.edit_message_text(
@@ -432,10 +453,11 @@ def clone_approve_callback(call, request_user_id):
     except Exception as e:
         logger.error(f"❌ Error approving clone request {request_user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ Approval failed: {str(e).replace('`', "'")}",
+            f"❌ **Approval failed:** `{str(e).replace('`', "'")}`",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=create_clone_request_panel()
+            reply_markup=create_clone_request_panel(),
+            parse_mode='Markdown'
         )
 
 
@@ -1740,11 +1762,14 @@ def handle_callbacks(call):
         elif data == 'clone_requests':
             admin_required_callback(call, clone_requests_callback)
         elif data.startswith('clone_req_view_'):
-            admin_required_callback(call, lambda c: clone_request_view_callback(c, data[len('clone_req_view_'):]))
+            request_id = data[len('clone_req_view_'):]
+            admin_required_callback(call, lambda c, rid=request_id: clone_request_view_callback(c, rid))
         elif data.startswith('clone_approve_'):
-            admin_required_callback(call, lambda c: clone_approve_callback(c, data[len('clone_approve_'):]))
+            request_id = data[len('clone_approve_'):]
+            admin_required_callback(call, lambda c, rid=request_id: clone_approve_callback(c, rid))
         elif data.startswith('clone_reject_'):
-            admin_required_callback(call, lambda c: clone_reject_callback(c, data[len('clone_reject_'):]))
+            request_id = data[len('clone_reject_'):]
+            admin_required_callback(call, lambda c, rid=request_id: clone_reject_callback(c, rid))
         elif data == 'clone_remove':
             clone_remove_callback(call)
         elif data == 'clone_remove_confirm':
@@ -2645,7 +2670,8 @@ def handle_token_input(message, original_chat_id, original_message_id):
             "⏳ Your clone request has been sent to the admin for approval.\n"
             "You will be notified after it is approved or rejected.",
             processing_msg.chat.id,
-            processing_msg.message_id
+            processing_msg.message_id,
+            parse_mode="Markdown"
         )
 
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2653,9 +2679,8 @@ def handle_token_input(message, original_chat_id, original_message_id):
             types.InlineKeyboardButton("🔎 Review", callback_data=f"clone_req_view_{user_id}"),
             types.InlineKeyboardButton("❌ Reject", callback_data=f"clone_reject_{user_id}")
         )
-        # Send the approval request as plain text.
-        # Bot usernames/tokens can contain characters such as '_' that may break
-        # Telegram Markdown entity parsing and prevent the admin message from being sent.
+        # Send admin notification as plain text. Bot usernames can contain `_`,
+        # which can break Telegram Markdown entity parsing.
         admin_text = (
             "🔔 New Clone Approval Request\n\n"
             f"👤 User ID: {user_id}\n"
@@ -2664,13 +2689,8 @@ def handle_token_input(message, original_chat_id, original_message_id):
             "Review this request from the Admin Panel."
         )
 
-        # Always include the configured owner as a notification recipient, even if
-        # the in-memory/database admin list has not loaded correctly.
-        notification_admins = set(admin_ids)
-        notification_admins.add(OWNER_ID)
-
         notified = 0
-        for admin_id in notification_admins:
+        for admin_id in list(admin_ids):
             try:
                 bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
                 notified += 1
@@ -2678,7 +2698,7 @@ def handle_token_input(message, original_chat_id, original_message_id):
                 logger.error(f"❌ Failed to notify admin {admin_id} about clone request: {e}")
 
         if notified == 0:
-            raise RuntimeError("Clone request was saved, but no admin could be notified.")
+            logger.error("❌ Clone request saved but no admin notification was delivered.")
 
         logger.info(
             f"🔔 Clone approval requested by {user_id} for @{bot_info.username}; "
@@ -2692,15 +2712,17 @@ def handle_token_input(message, original_chat_id, original_message_id):
             f"Error: {safe_error}\n\n"
             "💡 Make sure your token is valid and try again.",
             processing_msg.chat.id,
-            processing_msg.message_id
+            processing_msg.message_id,
+            parse_mode="Markdown"
         )
     except Exception as e:
         safe_error = str(e).replace("`", "'")
         logger.error(f"❌ Error creating clone approval request for {user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ Bot Clone Request Failed\n\nError: {safe_error}",
+            f"❌ **Bot Clone Request Failed**\n\nError: {safe_error}",
             processing_msg.chat.id,
-            processing_msg.message_id
+            processing_msg.message_id,
+            parse_mode="Markdown"
         )
 
 

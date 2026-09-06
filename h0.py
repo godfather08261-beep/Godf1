@@ -87,6 +87,7 @@ active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_clones = {}
+pending_clone_requests = {}
 
 # ===== LOGGING SETUP =====
 logging.basicConfig(level=logging.INFO,
@@ -410,8 +411,7 @@ def clone_approve_callback(call, request_user_id):
                 f"🚀 Status: Running",
                 call.message.chat.id,
                 call.message.message_id,
-                reply_markup=create_clone_request_panel(),
-                parse_mode='Markdown'
+                reply_markup=create_clone_request_panel()
             )
         else:
             bot.edit_message_text(
@@ -432,11 +432,10 @@ def clone_approve_callback(call, request_user_id):
     except Exception as e:
         logger.error(f"❌ Error approving clone request {request_user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ **Approval failed:** `{str(e).replace('`', "'")}`",
+            f"❌ Approval failed: {str(e).replace('`', "'")}",
             call.message.chat.id,
             call.message.message_id,
-            reply_markup=create_clone_request_panel(),
-            parse_mode='Markdown'
+            reply_markup=create_clone_request_panel()
         )
 
 
@@ -2646,8 +2645,7 @@ def handle_token_input(message, original_chat_id, original_message_id):
             "⏳ Your clone request has been sent to the admin for approval.\n"
             "You will be notified after it is approved or rejected.",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
 
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2683,17 +2681,15 @@ def handle_token_input(message, original_chat_id, original_message_id):
             f"Error: {safe_error}\n\n"
             "💡 Make sure your token is valid and try again.",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
     except Exception as e:
         safe_error = str(e).replace("`", "'")
         logger.error(f"❌ Error creating clone approval request for {user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ **Bot Clone Request Failed**\n\nError: {safe_error}",
+            f"❌ Bot Clone Request Failed\n\nError: {safe_error}",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
 
 

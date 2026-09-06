@@ -558,6 +558,7 @@ def create_clone_management_panel():
     markup = types.InlineKeyboardMarkup(row_width=1)
     if not user_clones:
         markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='clone_manage'))
+        markup.add(types.InlineKeyboardButton('🚫 Ban List', callback_data='clone_ban_list'))
         markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel'))
         return markup
     for clone_user_id, info in list(user_clones.items())[:30]:
@@ -569,6 +570,98 @@ def create_clone_management_panel():
     markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='clone_manage'))
     markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel'))
     return markup
+
+
+def create_clone_ban_list_panel():
+    """Build the admin clone-ban list with working navigation buttons."""
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            rows = conn.execute(
+                "SELECT user_id, ban_time FROM clone_bans ORDER BY ban_time DESC LIMIT 50"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for banned_user_id, ban_time in rows:
+        markup.add(types.InlineKeyboardButton(
+            f'🚫 {banned_user_id} | {str(ban_time)[:19]}',
+            callback_data=f'clone_ban_info_{banned_user_id}'
+        ))
+    markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='clone_ban_list'))
+    markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='clone_manage'))
+    return markup
+
+
+def clone_ban_list_callback(call):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            rows = conn.execute(
+                "SELECT user_id, ban_time FROM clone_bans ORDER BY ban_time DESC LIMIT 50"
+            ).fetchall()
+        finally:
+            conn.close()
+
+    if rows:
+        text = '🚫 Clone Ban List\n\n' + '\n'.join(
+            f'🚫 User ID: {uid}\n🕒 Banned: {str(ban_time)[:19]}'
+            for uid, ban_time in rows
+        )
+        text += f'\n\n📊 Total shown: {len(rows)}'
+    else:
+        text = '🚫 Clone Ban List\n\nNo banned clone users.'
+
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        text,
+        call.message.chat.id,
+        call.message.message_id,
+        reply_markup=create_clone_ban_list_panel()
+    )
+
+
+def clone_ban_info_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    try:
+        clone_user_id = int(clone_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, '❌ Invalid user ID.', show_alert=True)
+        return
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            row = conn.execute(
+                "SELECT ban_time FROM clone_bans WHERE user_id = ?", (clone_user_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+    if not row:
+        bot.answer_callback_query(call.id, '⚠️ Ban record not found.', show_alert=True)
+        clone_ban_list_callback(call)
+        return
+
+    text = (
+        '🚫 Banned Clone User\n\n'
+        f'👤 User ID: {clone_user_id}\n'
+        f'🕒 Banned: {str(row[0])[:19]}\n\n'
+        'This user cannot create a new clone bot.'
+    )
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton('🔙 Ban List', callback_data='clone_ban_list'))
+    markup.add(types.InlineKeyboardButton('🔙 Clone Bots', callback_data='clone_manage'))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(
+        text, call.message.chat.id, call.message.message_id, reply_markup=markup
+    )
 
 
 def clone_manage_callback(call):
@@ -609,6 +702,7 @@ def clone_manage_view_callback(call, clone_user_id):
         markup.row(types.InlineKeyboardButton('🟢 Start', callback_data=f'clone_start_{clone_user_id}'),
                    types.InlineKeyboardButton('🔄 Restart', callback_data=f'clone_restart_{clone_user_id}'))
     markup.add(types.InlineKeyboardButton('🚫 Ban Bot', callback_data=f'clone_ban_{clone_user_id}'))
+    markup.add(types.InlineKeyboardButton('🚫 Ban List', callback_data='clone_ban_list'))
     markup.add(types.InlineKeyboardButton('🔙 Clone List', callback_data='clone_manage'))
     bot.answer_callback_query(call.id)
     bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
@@ -1389,6 +1483,7 @@ def create_admin_panel():
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
     markup.row(types.InlineKeyboardButton('🔔 Clone Requests', callback_data='clone_requests'))
     markup.row(types.InlineKeyboardButton('🤖 Clone Bots', callback_data='clone_manage'))
+    markup.row(types.InlineKeyboardButton('🚫 Clone Ban List', callback_data='clone_ban_list'))
     markup.row(types.InlineKeyboardButton('🔙 Back', callback_data='back_to_main'))
     return markup
 
@@ -2058,6 +2153,8 @@ def handle_callbacks(call):
             admin_required_callback(call, remove_subscription_init_callback)
         elif data == 'list_subscriptions':
             admin_required_callback(call, list_subscriptions_callback)
+        elif data == 'admin_panel':
+            admin_required_callback(call, admin_panel_callback)
         elif data == 'clone_manage':
             admin_required_callback(call, clone_manage_callback)
         elif data.startswith('clone_manage_view_'):
@@ -2072,6 +2169,11 @@ def handle_callbacks(call):
         elif data.startswith('clone_restart_'):
             clone_user_id = data.split('_')[-1]
             admin_required_callback(call, lambda c: clone_restart_callback(c, clone_user_id))
+        elif data == 'clone_ban_list':
+            admin_required_callback(call, clone_ban_list_callback)
+        elif data.startswith('clone_ban_info_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_ban_info_callback(c, clone_user_id))
         elif data.startswith('clone_ban_confirm_'):
             clone_user_id = data.split('_')[-1]
             admin_required_callback(call, lambda c: clone_ban_confirm_callback(c, clone_user_id))

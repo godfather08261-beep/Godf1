@@ -88,6 +88,8 @@ admin_ids = {ADMIN_ID, OWNER_ID}
 bot_locked = False
 user_clones = {}
 pending_clone_requests = {}
+# Pending user file uploads waiting for admin approval.
+pending_file_requests = {}
 # Running clone processes keyed by owner/user ID.
 clone_processes = {}
 clone_log_handles = {}
@@ -134,6 +136,10 @@ def init_db():
                      (user_id INTEGER PRIMARY KEY, bot_username TEXT, token TEXT, create_time TEXT)''')
         c.execute('''CREATE TABLE IF NOT EXISTS clone_requests
                      (user_id INTEGER PRIMARY KEY, bot_username TEXT, token TEXT,
+                      request_time TEXT, status TEXT DEFAULT 'pending')''')
+        c.execute('''CREATE TABLE IF NOT EXISTS file_requests
+                     (request_id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER,
+                      file_name TEXT, file_type TEXT, file_path TEXT,
                       request_time TEXT, status TEXT DEFAULT 'pending')''')
         c.execute('''CREATE TABLE IF NOT EXISTS clone_bans
                      (user_id INTEGER PRIMARY KEY, ban_time TEXT)''')
@@ -199,10 +205,271 @@ def load_data():
             except ValueError:
                 logger.warning(f"⚠️ Invalid request_time for clone request of user {user_id}")
 
+        # Restore pending file approvals after Render/restarts.
+        c.execute("SELECT request_id, user_id, file_name, file_type, file_path, request_time FROM file_requests WHERE status = 'pending'")
+        for request_id, user_id, file_name, file_type, file_path, request_time in c.fetchall():
+            if os.path.exists(file_path):
+                try:
+                    pending_file_requests[int(request_id)] = {
+                        'user_id': int(user_id),
+                        'file_name': file_name,
+                        'file_type': file_type,
+                        'file_path': file_path,
+                        'request_time': datetime.fromisoformat(request_time)
+                    }
+                except (ValueError, TypeError):
+                    logger.warning(f"⚠️ Invalid request_time for file request {request_id}")
+            else:
+                logger.warning(f"⚠️ Pending file {file_path} for request {request_id} is missing; marking rejected.")
+                c.execute("UPDATE file_requests SET status='rejected' WHERE request_id=? AND status='pending'", (request_id,))
+        conn.commit()
+
         conn.close()
         logger.info(f"✅ Data loaded: 👥 {len(active_users)} users, 💳 {len(user_subscriptions)} subscriptions, 👑 {len(admin_ids)} admins, 🤖 {len(user_clones)} clones.")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
+
+# ===== FILE UPLOAD APPROVAL SYSTEM =====
+def refresh_pending_file_requests():
+    """Reload pending user file uploads from SQLite and discard missing files."""
+    pending_file_requests.clear()
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            rows = conn.execute(
+                "SELECT request_id, user_id, file_name, file_type, file_path, request_time "
+                "FROM file_requests WHERE status='pending' ORDER BY request_id ASC"
+            ).fetchall()
+            for request_id, user_id, file_name, file_type, file_path, request_time in rows:
+                if not os.path.exists(file_path):
+                    conn.execute("UPDATE file_requests SET status='rejected' WHERE request_id=? AND status='pending'", (request_id,))
+                    continue
+                try:
+                    request_dt = datetime.fromisoformat(request_time)
+                except (ValueError, TypeError):
+                    request_dt = datetime.now()
+                pending_file_requests[int(request_id)] = {
+                    'user_id': int(user_id), 'file_name': file_name,
+                    'file_type': file_type, 'file_path': file_path,
+                    'request_time': request_dt
+                }
+            conn.commit()
+        finally:
+            conn.close()
+    logger.info(f"🔄 Pending file requests refreshed: {len(pending_file_requests)}")
+
+
+def save_file_request(user_id, file_name, file_type, file_path):
+    request_time = datetime.now()
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            cur = conn.execute(
+                "INSERT INTO file_requests (user_id,file_name,file_type,file_path,request_time,status) "
+                "VALUES (?,?,?,?,?,'pending')",
+                (int(user_id), file_name, file_type, file_path, request_time.isoformat())
+            )
+            request_id = cur.lastrowid
+            conn.commit()
+            pending_file_requests[int(request_id)] = {
+                'user_id': int(user_id), 'file_name': file_name,
+                'file_type': file_type, 'file_path': file_path,
+                'request_time': request_time
+            }
+            return int(request_id)
+        except Exception as e:
+            logger.error(f"❌ Failed to save file approval request for {user_id}: {e}", exc_info=True)
+            return None
+        finally:
+            conn.close()
+
+
+def get_pending_file_request(request_id):
+    request_id = int(request_id)
+    req = pending_file_requests.get(request_id)
+    if req and os.path.exists(req.get('file_path', '')):
+        return req
+    refresh_pending_file_requests()
+    return pending_file_requests.get(request_id)
+
+
+def update_file_request_status(request_id, status):
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            cur = conn.execute(
+                "UPDATE file_requests SET status=? WHERE request_id=? AND status='pending'",
+                (status, int(request_id))
+            )
+            conn.commit()
+            changed = cur.rowcount > 0
+        finally:
+            conn.close()
+    pending_file_requests.pop(int(request_id), None)
+    return changed
+
+
+def create_file_request_panel():
+    refresh_pending_file_requests()
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for request_id, req in list(pending_file_requests.items())[:30]:
+        markup.add(types.InlineKeyboardButton(
+            f"📄 {req['file_name']} | {req['user_id']}",
+            callback_data=f"file_req_view_{request_id}"
+        ))
+    if not pending_file_requests:
+        markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='file_requests'))
+    else:
+        markup.add(types.InlineKeyboardButton('🔄 Refresh', callback_data='file_requests'))
+    markup.add(types.InlineKeyboardButton('🔙 Back', callback_data='admin_panel'))
+    return markup
+
+
+def file_requests_callback(call):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    refresh_pending_file_requests()
+    text = (
+        "📥 User File Approval Requests\n\n"
+        f"Pending requests: {len(pending_file_requests)}\n\n"
+        "Select a file to approve or reject."
+    )
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
+                          reply_markup=create_file_request_panel())
+
+
+def file_request_view_callback(call, request_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    try:
+        request_id = int(request_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, '❌ Invalid request.', show_alert=True)
+        return
+    req = get_pending_file_request(request_id)
+    if not req:
+        bot.answer_callback_query(call.id, '⚠️ Request already processed or file missing.', show_alert=True)
+        return file_requests_callback(call)
+    request_time = req.get('request_time')
+    time_str = request_time.strftime('%Y-%m-%d %H:%M:%S') if request_time else 'Unknown'
+    text = (
+        "📥 File Approval Request\n\n"
+        f"👤 User ID: {req['user_id']}\n"
+        f"📄 File: {req['file_name']}\n"
+        f"📦 Type: {req['file_type']}\n"
+        f"🕒 Requested: {time_str}\n\n"
+        "Choose an action:"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton('✅ Approve', callback_data=f'file_req_approve_{request_id}'),
+        types.InlineKeyboardButton('❌ Reject', callback_data=f'file_req_reject_{request_id}')
+    )
+    markup.add(types.InlineKeyboardButton('🔙 Requests', callback_data='file_requests'))
+    bot.answer_callback_query(call.id)
+    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+
+
+def file_request_approve_callback(call, request_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    try:
+        request_id = int(request_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, '❌ Invalid request.', show_alert=True)
+        return
+    req = get_pending_file_request(request_id)
+    if not req:
+        bot.answer_callback_query(call.id, '⚠️ Request already processed or file missing.', show_alert=True)
+        return file_requests_callback(call)
+    user_id = req['user_id']
+    file_name = req['file_name']
+    file_path = req['file_path']
+    # Re-check the user's limit at approval time.
+    limit = get_user_file_limit(user_id)
+    if get_user_file_count(user_id) >= limit:
+        bot.answer_callback_query(call.id, '⚠️ User file limit reached.', show_alert=True)
+        return
+    if not os.path.exists(file_path):
+        update_file_request_status(request_id, 'rejected')
+        bot.answer_callback_query(call.id, '❌ Pending file is missing.', show_alert=True)
+        return file_requests_callback(call)
+
+    bot.answer_callback_query(call.id, '⏳ Approving file...')
+    try:
+        user_folder = get_user_folder(user_id)
+        if req['file_type'] == 'zip':
+            with open(file_path, 'rb') as f:
+                content = f.read()
+            update_file_request_status(request_id, 'approved')
+            handle_zip_file(content, file_name, types.SimpleNamespace(from_user=types.SimpleNamespace(id=user_id), chat=types.SimpleNamespace(id=user_id), message_id=call.message.message_id))
+        else:
+            final_path = os.path.join(user_folder, file_name)
+            if os.path.exists(final_path):
+                os.remove(final_path)
+            shutil.move(file_path, final_path)
+            update_file_request_status(request_id, 'approved')
+            fake_message = types.SimpleNamespace(
+                from_user=types.SimpleNamespace(id=user_id),
+                chat=types.SimpleNamespace(id=user_id),
+                message_id=call.message.message_id
+            )
+            if req['file_type'] == 'py':
+                handle_py_file(final_path, user_id, user_folder, file_name, fake_message)
+            else:
+                handle_js_file(final_path, user_id, user_folder, file_name, fake_message)
+        bot.send_message(user_id, f"✅ File approved by admin.\n📄 {file_name}\n🚀 Processing/starting now.")
+        bot.edit_message_text(
+            f"✅ File Approved\n\n👤 User ID: {user_id}\n📄 File: {file_name}\n🚀 Status: Processing/Starting",
+            call.message.chat.id, call.message.message_id, reply_markup=create_file_request_panel()
+        )
+    except Exception as e:
+        logger.error(f"❌ Error approving file request {request_id}: {e}", exc_info=True)
+        # Keep it pending when processing failed, so the admin can retry.
+        bot.answer_callback_query(call.id, '❌ Approval failed; request kept pending.', show_alert=True)
+        try:
+            bot.edit_message_text(
+                f"❌ File approval failed\n\nRequest ID: {request_id}\nError: {e}",
+                call.message.chat.id, call.message.message_id,
+                reply_markup=create_file_request_panel()
+            )
+        except Exception:
+            pass
+
+
+def file_request_reject_callback(call, request_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    try:
+        request_id = int(request_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, '❌ Invalid request.', show_alert=True)
+        return
+    req = get_pending_file_request(request_id)
+    if not req:
+        bot.answer_callback_query(call.id, '⚠️ Request already processed.', show_alert=True)
+        return file_requests_callback(call)
+    update_file_request_status(request_id, 'rejected')
+    try:
+        if os.path.exists(req['file_path']):
+            os.remove(req['file_path'])
+    except Exception as e:
+        logger.error(f"❌ Failed removing rejected file {req['file_path']}: {e}")
+    bot.answer_callback_query(call.id, '❌ File rejected.')
+    try:
+        bot.send_message(req['user_id'], f"❌ File upload rejected by admin.\n📄 {req['file_name']}")
+    except Exception:
+        pass
+    bot.edit_message_text(
+        f"❌ File Rejected\n\n👤 User ID: {req['user_id']}\n📄 File: {req['file_name']}",
+        call.message.chat.id, call.message.message_id, reply_markup=create_file_request_panel()
+    )
+
 
 # ===== CLONE BOT FUNCTIONS =====
 def save_clone_info(user_id, bot_username, token):
@@ -778,7 +1045,7 @@ def clone_stop_callback(call, clone_user_id):
     if proc is None:
         bot.answer_callback_query(call.id, '🔴 Clone is already stopped.', show_alert=True)
     else:
-        try: stop_clone_process(proc)
+        try: kill_process_tree(proc)
         except Exception as e: logger.error(f'❌ Error stopping clone {clone_user_id}: {e}', exc_info=True)
         clone_processes.pop(clone_user_id, None)
         handle = clone_log_handles.pop(clone_user_id, None)
@@ -800,7 +1067,7 @@ def clone_restart_callback(call, clone_user_id):
         bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
     proc = get_clone_process(clone_user_id)
     if proc is not None:
-        try: stop_clone_process(proc)
+        try: kill_process_tree(proc)
         except Exception as e: logger.error(f'❌ Error stopping clone for restart {clone_user_id}: {e}', exc_info=True)
         clone_processes.pop(clone_user_id, None)
         handle = clone_log_handles.pop(clone_user_id, None)
@@ -845,7 +1112,7 @@ def clone_ban_confirm_callback(call, clone_user_id):
         bot.answer_callback_query(call.id, '⚠️ Clone not found.', show_alert=True); clone_manage_callback(call); return
     proc = get_clone_process(clone_user_id)
     if proc is not None:
-        try: stop_clone_process(proc)
+        try: kill_process_tree(proc)
         except Exception as e: logger.error(f'❌ Error banning clone {clone_user_id}: {e}', exc_info=True)
     clone_processes.pop(clone_user_id, None)
     handle = clone_log_handles.pop(clone_user_id, None)
@@ -1007,69 +1274,6 @@ def kill_process_tree(process_info):
         else: logger.error(f"❌ Process object missing for {script_key}, and no log file. Cannot kill.")
     except Exception as e:
         logger.error(f"❌ Unexpected error killing process tree for PID {pid or 'N/A'} ({script_key}): {e}", exc_info=True)
-
-# ===== CLONE PROCESS TERMINATION =====
-def stop_clone_process(process):
-    """Reliably stop a clone subprocess and its entire process group."""
-    if process is None:
-        return True
-
-    try:
-        pid = process.pid
-    except Exception:
-        return True
-
-    if not pid:
-        return True
-
-    # create_bot_clone() starts each clone with start_new_session=True, so the
-    # clone PID is the leader of its own process group. Killing that group
-    # prevents child workers/polling processes from remaining alive.
-    try:
-        if process.poll() is None:
-            try:
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-
-            try:
-                process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=2)
-                except Exception:
-                    pass
-
-        # Extra psutil cleanup for descendants that may have escaped the
-        # process-group termination.
-        try:
-            parent = psutil.Process(pid)
-            children = parent.children(recursive=True)
-            for child in children:
-                try:
-                    if child.is_running():
-                        child.kill()
-                except (psutil.NoSuchProcess, psutil.ZombieProcess):
-                    pass
-        except (psutil.NoSuchProcess, psutil.ZombieProcess):
-            pass
-
-        logger.info(f"🛑 Clone process terminated for PID {pid}")
-        return process.poll() is not None
-    except Exception as e:
-        logger.error(f"❌ Failed to terminate clone PID {pid}: {e}", exc_info=True)
-        # Last-resort Popen kill.
-        try:
-            if process.poll() is None:
-                process.kill()
-                process.wait(timeout=2)
-            return process.poll() is not None
-        except Exception:
-            return False
 
 # ===== PYTHON MODULES MAPPING =====
 TELEGRAM_MODULES = {
@@ -1583,6 +1787,7 @@ def create_admin_panel():
     )
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
     markup.row(types.InlineKeyboardButton('🔔 Clone Requests', callback_data='clone_requests'))
+    markup.row(types.InlineKeyboardButton('📥 File Requests', callback_data='file_requests'))
     markup.row(types.InlineKeyboardButton('🤖 Clone Bots', callback_data='clone_manage'))
     markup.row(types.InlineKeyboardButton('🚫 Clone Ban List', callback_data='clone_ban_list'))
     markup.row(types.InlineKeyboardButton('🔙 Back', callback_data='back_to_main'))
@@ -2155,7 +2360,7 @@ def user_clone_stop_callback(call):
         bot.answer_callback_query(call.id, "🔴 Clone is already stopped.", show_alert=True)
     else:
         try:
-            stop_clone_process(proc)
+            kill_process_tree(proc)
         except Exception as e:
             logger.error(f"❌ Error stopping user clone {user_id}: {e}", exc_info=True)
         clone_processes.pop(user_id, None)
@@ -2178,7 +2383,7 @@ def user_clone_restart_callback(call):
     proc = get_clone_process(user_id)
     if proc is not None:
         try:
-            stop_clone_process(proc)
+            kill_process_tree(proc)
         except Exception as e:
             logger.error(f"❌ Error stopping user clone {user_id} for restart: {e}", exc_info=True)
         clone_processes.pop(user_id, None)
@@ -2338,6 +2543,63 @@ def handle_file_upload_doc(message):
     if doc.file_size > max_file_size:
         bot.reply_to(message, f"⚠️ File too large (Max: {max_file_size // 1024 // 1024} MB)."); return
 
+    # Admin uploads remain direct. Normal users must get admin approval before
+    # their file is saved to the active user folder or executed.
+    if user_id not in admin_ids:
+        try:
+            pending_dir = os.path.join(BASE_DIR, 'pending_uploads')
+            os.makedirs(pending_dir, exist_ok=True)
+            safe_name = os.path.basename(file_name).replace('\\', '_')
+            unique_name = f"{int(time.time()*1000)}_{user_id}_{safe_name}"
+            pending_path = os.path.join(pending_dir, unique_name)
+            file_info_tg_doc = bot.get_file(doc.file_id)
+            downloaded_file_content = bot.download_file(file_info_tg_doc.file_path)
+            with open(pending_path, 'wb') as f:
+                f.write(downloaded_file_content)
+            file_type = file_ext.lstrip('.')
+            request_id = save_file_request(user_id, file_name, file_type, pending_path)
+            if not request_id:
+                try: os.remove(pending_path)
+                except Exception: pass
+                bot.reply_to(message, '❌ Could not create approval request. Please try again.')
+                return
+            bot.reply_to(
+                message,
+                f"📥 File uploaded for approval.\n\n📄 File: {file_name}\n🆔 Request ID: {request_id}\n⏳ Waiting for admin approval."
+            )
+            admin_markup = types.InlineKeyboardMarkup(row_width=2)
+            admin_markup.row(
+                types.InlineKeyboardButton('🔎 Review', callback_data=f'file_req_view_{request_id}'),
+                types.InlineKeyboardButton('❌ Reject', callback_data=f'file_req_reject_{request_id}')
+            )
+            admin_text = (
+                '📥 New User File Approval Request\n\n'
+                f'👤 User ID: {user_id}\n'
+                f'📄 File: {file_name}\n'
+                f'📦 Type: {file_type}\n'
+                f'🆔 Request ID: {request_id}\n'
+                f'🕒 Time: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n'
+                'Review from Admin Panel.'
+            )
+            notified = 0
+            for admin_id in list(admin_ids):
+                try:
+                    bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
+                    notified += 1
+                except Exception as e:
+                    logger.error(f'❌ Failed to notify admin {admin_id} about file request {request_id}: {e}')
+            logger.info(f'📥 File approval request {request_id} created; admins notified: {notified}')
+            return
+        except telebot.apihelper.ApiTelegramException as e:
+            logger.error(f'❌ Telegram API error creating file request for {user_id}: {e}', exc_info=True)
+            bot.reply_to(message, f'⚠️ Telegram API error: {str(e)}')
+            return
+        except Exception as e:
+            logger.error(f'❌ Error creating file approval request for {user_id}: {e}', exc_info=True)
+            bot.reply_to(message, f'❌ File approval request failed: {str(e)}')
+            return
+
+    # Admin/owner bypass approval and continue with the existing direct flow.
     try:
         try:
             bot.forward_message(OWNER_ID, chat_id, message.message_id)
@@ -2389,6 +2651,18 @@ def handle_callbacks(call):
         request_id = data.split('_')[-1]
         admin_required_callback(call, lambda c: clone_reject_callback(c, request_id))
         return
+    if data.startswith('file_req_view_'):
+        request_id = data.split('_')[-1]
+        admin_required_callback(call, lambda c: file_request_view_callback(c, request_id))
+        return
+    if data.startswith('file_req_approve_'):
+        request_id = data.split('_')[-1]
+        admin_required_callback(call, lambda c: file_request_approve_callback(c, request_id))
+        return
+    if data.startswith('file_req_reject_'):
+        request_id = data.split('_')[-1]
+        admin_required_callback(call, lambda c: file_request_reject_callback(c, request_id))
+        return
 
     if bot_locked and user_id not in admin_ids and data not in ['back_to_main']:
         bot.answer_callback_query(call.id, "⚠️ Bot locked by admin.", show_alert=True)
@@ -2430,6 +2704,8 @@ def handle_callbacks(call):
             admin_required_callback(call, list_subscriptions_callback)
         elif data == 'admin_panel':
             admin_required_callback(call, admin_panel_callback)
+        elif data == 'file_requests':
+            admin_required_callback(call, file_requests_callback)
         elif data == 'clone_manage':
             admin_required_callback(call, clone_manage_callback)
         elif data.startswith('clone_manage_view_'):
@@ -3455,7 +3731,7 @@ def cleanup():
     for clone_user_id, proc in list(clone_processes.items()):
         try:
             if proc.poll() is None:
-                stop_clone_process(proc)
+                kill_process_tree(proc)
                 logger.info(f"🧹 Stopped clone worker for user {clone_user_id} (PID {proc.pid}).")
         except Exception as e:
             logger.error(f"❌ Failed stopping clone worker {clone_user_id}: {e}")

@@ -656,12 +656,50 @@ def clone_ban_info_callback(call, clone_user_id):
         'This user cannot create a new clone bot.'
     )
     markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton('🔓 Unban User', callback_data=f'clone_unban_{clone_user_id}'))
     markup.add(types.InlineKeyboardButton('🔙 Ban List', callback_data='clone_ban_list'))
     markup.add(types.InlineKeyboardButton('🔙 Clone Bots', callback_data='clone_manage'))
     bot.answer_callback_query(call.id)
     bot.edit_message_text(
         text, call.message.chat.id, call.message.message_id, reply_markup=markup
     )
+
+
+def clone_unban_callback(call, clone_user_id):
+    if call.from_user.id not in admin_ids:
+        bot.answer_callback_query(call.id, '⛔ Admin only.', show_alert=True)
+        return
+    try:
+        clone_user_id = int(clone_user_id)
+    except (ValueError, TypeError):
+        bot.answer_callback_query(call.id, '❌ Invalid user ID.', show_alert=True)
+        return
+
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        try:
+            row = conn.execute(
+                'SELECT user_id FROM clone_bans WHERE user_id = ?', (clone_user_id,)
+            ).fetchone()
+            if not row:
+                bot.answer_callback_query(call.id, '⚠️ User is not banned.', show_alert=True)
+                clone_ban_list_callback(call)
+                return
+            conn.execute('DELETE FROM clone_bans WHERE user_id = ?', (clone_user_id,))
+            conn.commit()
+        finally:
+            conn.close()
+
+    clone_banned_users.discard(clone_user_id)
+    bot.answer_callback_query(call.id, '🔓 User unbanned successfully.')
+    try:
+        bot.send_message(
+            clone_user_id,
+            '🔓 Your clone access has been unbanned by an admin. You can submit a new clone request.'
+        )
+    except Exception:
+        pass
+    clone_ban_list_callback(call)
 
 
 def clone_manage_callback(call):
@@ -2177,6 +2215,9 @@ def handle_callbacks(call):
         elif data.startswith('clone_ban_confirm_'):
             clone_user_id = data.split('_')[-1]
             admin_required_callback(call, lambda c: clone_ban_confirm_callback(c, clone_user_id))
+        elif data.startswith('clone_unban_'):
+            clone_user_id = data.split('_')[-1]
+            admin_required_callback(call, lambda c: clone_unban_callback(c, clone_user_id))
         elif data.startswith('clone_ban_'):
             clone_user_id = data.split('_')[-1]
             admin_required_callback(call, lambda c: clone_ban_callback(c, clone_user_id))

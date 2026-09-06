@@ -1312,16 +1312,23 @@ def handle_py_file(file_path, script_owner_id, user_folder, file_name, message):
 
 # ===== CREATE BOT CLONE =====
 def create_bot_clone(user_id, token, bot_username):
+    """Create and start a clone bot after admin approval.
+
+    The clone gets its own directory and token, while its stdout/stderr are
+    written to a log file so a failed clone cannot silently fill PIPE buffers.
+    """
     try:
         clone_dir = os.path.join(BASE_DIR, f'clone_{user_id}')
         os.makedirs(clone_dir, exist_ok=True)
 
         current_file = __file__
         clone_file = os.path.join(clone_dir, 'bot.py')
+        clone_log = os.path.join(clone_dir, 'clone.log')
 
         with open(current_file, 'r', encoding='utf-8') as f:
             script_content = f.read()
 
+        # Replace only the configured owner/main token values in the source.
         script_content = script_content.replace(BOT_TOKEN, token)
         script_content = script_content.replace(str(OWNER_ID), str(user_id))
         script_content = script_content.replace(str(ADMIN_ID), str(user_id))
@@ -1329,19 +1336,36 @@ def create_bot_clone(user_id, token, bot_username):
         with open(clone_file, 'w', encoding='utf-8') as f:
             f.write(script_content)
 
-        clone_process = subprocess.Popen(
-            [sys.executable, clone_file],
-            cwd=clone_dir,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE
-        )
+        log_file = open(clone_log, 'a', encoding='utf-8')
+        try:
+            clone_process = subprocess.Popen(
+                [sys.executable, clone_file],
+                cwd=clone_dir,
+                stdout=log_file,
+                stderr=log_file,
+                stdin=subprocess.DEVNULL
+            )
+        except Exception:
+            log_file.close()
+            raise
+
+        # Give the clone a moment to fail fast (invalid token, syntax error,
+        # Telegram 409, etc.) before marking the approval as successful.
+        time.sleep(2)
+        return_code = clone_process.poll()
+        if return_code is not None:
+            log_file.close()
+            logger.error(
+                f"❌ Clone @{bot_username} exited immediately for user {user_id} "
+                f"with code {return_code}. See {clone_log}"
+            )
+            return False
 
         save_clone_info(user_id, bot_username, token)
         logger.info(f"✅ Bot clone created successfully for user {user_id}, bot @{bot_username}")
         return True
     except Exception as e:
-        logger.error(f"❌ Error creating bot clone: {e}")
+        logger.error(f"❌ Error creating bot clone @{bot_username} for user {user_id}: {e}", exc_info=True)
         return False
 
 # ===== LOGIC: SEND WELCOME =====
@@ -2688,15 +2712,16 @@ def handle_token_input(message, original_chat_id, original_message_id):
         if not save_clone_request(user_id, bot_info.username, token):
             raise RuntimeError("Could not save clone approval request.")
 
+        # Keep clone approval messages as plain text. Bot usernames can contain '_'
+        # (for example @Godsp4m_bot), which can break Telegram Markdown parsing.
         bot.edit_message_text(
-            f"🔔 **Approval Requested!**\n\n"
+            f"🔔 Approval Requested!\n\n"
             f"🤖 Bot: @{bot_info.username}\n"
-            f"👤 User ID: `{user_id}`\n\n"
+            f"👤 User ID: {user_id}\n\n"
             "⏳ Your clone request has been sent to the admin for approval.\n"
             "You will be notified after it is approved or rejected.",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
 
         admin_markup = types.InlineKeyboardMarkup(row_width=2)
@@ -2715,7 +2740,8 @@ def handle_token_input(message, original_chat_id, original_message_id):
         notified = 0
         for admin_id in list(admin_ids):
             try:
-                bot.send_message(admin_id, admin_text, reply_markup=admin_markup, parse_mode="Markdown")
+                # Plain text avoids 400 "can't parse entities" for bot usernames.
+                bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
                 notified += 1
             except Exception as e:
                 logger.error(f"❌ Failed to notify admin {admin_id} about clone request: {e}")
@@ -2728,21 +2754,19 @@ def handle_token_input(message, original_chat_id, original_message_id):
     except telebot.apihelper.ApiTelegramException as e:
         safe_error = str(e).replace("`", "'")
         bot.edit_message_text(
-            f"❌ **Bot Clone Request Failed**\n\n"
+            f"❌ Bot Clone Request Failed\n\n"
             f"Error: {safe_error}\n\n"
             "💡 Make sure your token is valid and try again.",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
     except Exception as e:
         safe_error = str(e).replace("`", "'")
         logger.error(f"❌ Error creating clone approval request for {user_id}: {e}", exc_info=True)
         bot.edit_message_text(
-            f"❌ **Bot Clone Request Failed**\n\nError: {safe_error}",
+            f"❌ Bot Clone Request Failed\n\nError: {safe_error}",
             processing_msg.chat.id,
-            processing_msg.message_id,
-            parse_mode="Markdown"
+            processing_msg.message_id
         )
 
 

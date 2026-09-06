@@ -67,9 +67,9 @@ IROTECH_DIR = os.path.join(BASE_DIR, 'inf')
 DATABASE_PATH = os.path.join(IROTECH_DIR, 'bot_data.db')
 
 # ===== USER LIMITS =====
-FREE_USER_LIMIT = 3
+FREE_USER_LIMIT = 4
 SUBSCRIBED_USER_LIMIT = 25
-ADMIN_LIMIT = float('inf')
+ADMIN_LIMIT = 999
 OWNER_LIMIT = float('inf')
 
 # ===== CREATE DIRECTORIES =====
@@ -1692,8 +1692,10 @@ def create_bot_clone(user_id, token, bot_username):
             script_content = f.read()
 
         # Make the requesting user the Owner + Admin inside their clone.
-        script_content = script_content.replace(str(OWNER_ID), str(user_id))
-        script_content = script_content.replace(str(ADMIN_ID), str(user_id))
+        # Replace only the two configuration assignments, not arbitrary numeric
+        # IDs elsewhere in the source code.
+        script_content = re.sub(r'(?m)^OWNER_ID\s*=\s*.*$', f'OWNER_ID = {user_id}', script_content, count=1)
+        script_content = re.sub(r'(?m)^ADMIN_ID\s*=\s*.*$', f'ADMIN_ID = {user_id}', script_content, count=1)
 
         # A clone is a Telegram worker, not another Render web service.
         # This prevents the child process from fighting the main process for
@@ -1715,6 +1717,7 @@ def create_bot_clone(user_id, token, bot_username):
         clone_env = os.environ.copy()
         clone_env['BOT_TOKEN'] = token
         clone_env['CLONE_MODE'] = '1'
+        clone_env['PYTHONUNBUFFERED'] = '1'
 
         log_handle = open(log_path, 'a', encoding='utf-8', buffering=1)
         clone_process = subprocess.Popen(
@@ -1999,14 +2002,23 @@ def _logic_run_all_scripts(message):
 
 # ==== LOGIC: CLONE BOT =====
 def create_user_clone_control_panel(user_id):
-    """Create the clone controls shown to the clone owner from the user menu."""
+    """Create controls for the current user's own clone only.
+
+    Clone creation/approval is kept separate from the admin Clone Bot
+    management panel.  The user-facing My Bot menu never exposes admin
+    clone-management callbacks.
+    """
+    user_id = int(user_id)
     markup = types.InlineKeyboardMarkup(row_width=2)
-    info = user_clones.get(int(user_id))
+    info = user_clones.get(user_id)
+
     if not info:
-        markup.row(
-            types.InlineKeyboardButton("🚀 Create Clone", callback_data="clone_create"),
-            types.InlineKeyboardButton("🔄 Refresh", callback_data="user_clone_controls")
-        )
+        if get_pending_clone_request(user_id):
+            markup.add(types.InlineKeyboardButton("⏳ Approval Pending", callback_data="user_clone_controls"))
+            markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="user_clone_controls"))
+        else:
+            markup.add(types.InlineKeyboardButton("🚀 Create Clone", callback_data="clone_create"))
+            markup.add(types.InlineKeyboardButton("🔄 Refresh", callback_data="user_clone_controls"))
         markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_main"))
         return markup
 
@@ -2121,33 +2133,60 @@ def user_clone_restart_callback(call):
     user_clone_controls_callback(call)
 
 
-def _logic_clone_bot(message):
+def _logic_my_bot(message):
+    """User-facing My Bot menu: show only the user's own clone."""
     user_id = message.from_user.id
     info = user_clones.get(user_id)
+    pending = get_pending_clone_request(user_id)
 
     if info:
         running = clone_status(user_id)
         status = "🟢 Running" if running else "🔴 Stopped"
-        clone_text = (
-            "🤖 Your Clone Bot\n\n"
+        text = (
+            "🤖 My Bot\n\n"
             f"🤖 Bot: @{info['bot_username']}\n"
             f"📊 Status: {status}\n\n"
-            "🎯 Clone controls:"
+            "🎯 Your clone controls:"
         )
-        markup = create_user_clone_control_panel(user_id)
+    elif pending:
+        text = (
+            "🤖 My Bot\n\n"
+            f"🤖 Bot: @{pending['bot_username']}\n"
+            "⏳ Status: Waiting for admin approval\n\n"
+            "Your request is already pending. You will be notified after approval or rejection."
+        )
     else:
-        clone_text = (
-            "🤖 Clone Bot Service\n\n"
-            f"📊 Total Clones: {len(user_clones)}\n\n"
-            "🎯 Features in your clone:\n"
-            "• 📁 Unlimited file hosting\n"
-            "• 🛡️ Security scanning\n"
-            "• 💾 File hosting\n"
-            "• ⚡ Auto-restart\n\n"
+        text = (
+            "🤖 My Bot\n\n"
+            "You don't have a clone bot yet.\n"
+            "Create one and wait for admin approval.\n\n"
+            "🎯 After approval, Start / Stop / Restart / Remove controls will appear here."
         )
-        markup = create_user_clone_control_panel(user_id)
 
-    bot.reply_to(message, clone_text, reply_markup=markup, parse_mode="Markdown")
+    bot.reply_to(message, text, reply_markup=create_user_clone_control_panel(user_id))
+
+
+def _logic_clone_bot(message):
+    """Admin-only Clone Bot management menu.
+
+    This is intentionally separate from the user's My Bot menu.
+    """
+    if message.from_user.id not in admin_ids:
+        bot.reply_to(message, "⛔ Admin permissions required.")
+        return
+    text = (
+        "🤖 Clone Bot Admin Control\n\n"
+        f"📊 Total approved clones: {len(user_clones)}\n"
+        "Choose what you want to manage:"
+    )
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.row(
+        types.InlineKeyboardButton("🔔 Clone Requests", callback_data="clone_requests"),
+        types.InlineKeyboardButton("🤖 Clone Bots", callback_data="clone_manage")
+    )
+    markup.add(types.InlineKeyboardButton("🚫 Ban List", callback_data="clone_ban_list"))
+    markup.add(types.InlineKeyboardButton("🔙 Back", callback_data="back_to_main"))
+    bot.reply_to(message, text, reply_markup=markup)
 
 # ===== MESSAGE HANDLERS =====
 @bot.message_handler(commands=['start', 'help'])
@@ -2169,7 +2208,7 @@ BUTTON_TEXT_TO_LOGIC = {
     "🔒 Lock Bot": _logic_toggle_lock_bot,
     "🟢 Run All User Scripts": _logic_run_all_scripts,
     "👑 Admin Panel": _logic_admin_panel,
-    "🤖 My Bot": _logic_clone_bot,
+    "🤖 My Bot": _logic_my_bot,
     "🤖 Clone Bot": _logic_clone_bot
 }
 
@@ -2204,6 +2243,8 @@ def command_admin_panel(message): _logic_admin_panel(message)
 def command_run_all_scripts(message): _logic_run_all_scripts(message)
 @bot.message_handler(commands=['clonebot'])
 def command_clone_bot(message): _logic_clone_bot(message)
+@bot.message_handler(commands=['mybot'])
+def command_my_bot(message): _logic_my_bot(message)
 
 # ===== HANDLE FILE UPLOAD =====
 @bot.message_handler(content_types=['document'])
@@ -3137,6 +3178,19 @@ def clone_create_callback(call):
     user_id = call.from_user.id
     chat_id = call.message.chat.id
     message_id = call.message.message_id
+
+    # Creation is a user action.  Admin approval happens only after the
+    # request is saved and sent to the admin panel.
+    if user_id in clone_banned_users:
+        bot.answer_callback_query(call.id, "🚫 Clone access is banned.", show_alert=True)
+        return
+    if get_pending_clone_request(user_id):
+        bot.answer_callback_query(call.id, "⏳ Clone request is already pending.", show_alert=True)
+        return
+    if user_id in user_clones:
+        bot.answer_callback_query(call.id, "🤖 You already have a clone bot.", show_alert=True)
+        user_clone_controls_callback(call)
+        return
     
     markup = types.InlineKeyboardMarkup(row_width=2)
     markup.row(types.InlineKeyboardButton("❌ Cancel", callback_data="back_to_main"))

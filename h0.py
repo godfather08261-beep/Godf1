@@ -2653,21 +2653,32 @@ def handle_token_input(message, original_chat_id, original_message_id):
             types.InlineKeyboardButton("🔎 Review", callback_data=f"clone_req_view_{user_id}"),
             types.InlineKeyboardButton("❌ Reject", callback_data=f"clone_reject_{user_id}")
         )
+        # Send the approval request as plain text.
+        # Bot usernames/tokens can contain characters such as '_' that may break
+        # Telegram Markdown entity parsing and prevent the admin message from being sent.
         admin_text = (
-            "🔔 **New Clone Approval Request**\n\n"
-            f"👤 User ID: `{user_id}`\n"
+            "🔔 New Clone Approval Request\n\n"
+            f"👤 User ID: {user_id}\n"
             f"🤖 Bot: @{bot_info.username}\n"
-            f"🕒 Time: `{datetime.now():%Y-%m-%d %H:%M:%S}`\n\n"
+            f"🕒 Time: {datetime.now():%Y-%m-%d %H:%M:%S}\n\n"
             "Review this request from the Admin Panel."
         )
 
+        # Always include the configured owner as a notification recipient, even if
+        # the in-memory/database admin list has not loaded correctly.
+        notification_admins = set(admin_ids)
+        notification_admins.add(OWNER_ID)
+
         notified = 0
-        for admin_id in list(admin_ids):
+        for admin_id in notification_admins:
             try:
-                bot.send_message(admin_id, admin_text, reply_markup=admin_markup, parse_mode="Markdown")
+                bot.send_message(admin_id, admin_text, reply_markup=admin_markup)
                 notified += 1
             except Exception as e:
                 logger.error(f"❌ Failed to notify admin {admin_id} about clone request: {e}")
+
+        if notified == 0:
+            raise RuntimeError("Clone request was saved, but no admin could be notified.")
 
         logger.info(
             f"🔔 Clone approval requested by {user_id} for @{bot_info.username}; "

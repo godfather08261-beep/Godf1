@@ -310,6 +310,36 @@ def update_file_request_status(request_id, status):
     return changed
 
 
+def edit_file_approval_message(call, text, reply_markup=None):
+    """Edit an approval message safely whether it is a document or text message.
+    Telegram does not allow edit_message_text() on document messages; user file
+    approval notifications are sent as documents, so their caption must be edited.
+    If Telegram still refuses the edit, send a fresh action message instead.
+    """
+    chat_id = call.message.chat.id
+    message_id = call.message.message_id
+    try:
+        if getattr(call.message, 'content_type', None) == 'document':
+            return bot.edit_message_caption(
+                text, chat_id, message_id, reply_markup=reply_markup
+            )
+        return bot.edit_message_text(
+            text, chat_id, message_id, reply_markup=reply_markup
+        )
+    except Exception as e:
+        logger.warning(
+            f"⚠️ Could not edit file approval message {message_id}: {e}. Sending fallback action message."
+        )
+        try:
+            return bot.send_message(chat_id, text, reply_markup=reply_markup)
+        except Exception as send_error:
+            logger.error(
+                f"❌ Could not send fallback file approval message: {send_error}",
+                exc_info=True
+            )
+            return None
+
+
 def create_file_request_panel():
     refresh_pending_file_requests()
     markup = types.InlineKeyboardMarkup(row_width=1)
@@ -337,8 +367,7 @@ def file_requests_callback(call):
         "Select a file to approve or reject."
     )
     bot.answer_callback_query(call.id)
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                          reply_markup=create_file_request_panel())
+    edit_file_approval_message(call, text, create_file_request_panel())
 
 
 def file_request_view_callback(call, request_id):
@@ -371,7 +400,7 @@ def file_request_view_callback(call, request_id):
     )
     markup.add(types.InlineKeyboardButton('🔙 Requests', callback_data='file_requests'))
     bot.answer_callback_query(call.id)
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=markup)
+    edit_file_approval_message(call, text, markup)
 
 
 def file_request_approve_callback(call, request_id):
@@ -424,19 +453,20 @@ def file_request_approve_callback(call, request_id):
             else:
                 handle_js_file(final_path, user_id, user_folder, file_name, fake_message)
         bot.send_message(user_id, f"✅ File approved by admin.\n📄 {file_name}\n🚀 Processing/starting now.")
-        bot.edit_message_text(
+        edit_file_approval_message(
+            call,
             f"✅ File Approved\n\n👤 User ID: {user_id}\n📄 File: {file_name}\n🚀 Status: Processing/Starting",
-            call.message.chat.id, call.message.message_id, reply_markup=create_file_request_panel()
+            create_file_request_panel()
         )
     except Exception as e:
         logger.error(f"❌ Error approving file request {request_id}: {e}", exc_info=True)
         # Keep it pending when processing failed, so the admin can retry.
         bot.answer_callback_query(call.id, '❌ Approval failed; request kept pending.', show_alert=True)
         try:
-            bot.edit_message_text(
+            edit_file_approval_message(
+                call,
                 f"❌ File approval failed\n\nRequest ID: {request_id}\nError: {e}",
-                call.message.chat.id, call.message.message_id,
-                reply_markup=create_file_request_panel()
+                create_file_request_panel()
             )
         except Exception:
             pass
@@ -466,9 +496,10 @@ def file_request_reject_callback(call, request_id):
         bot.send_message(req['user_id'], f"❌ File upload rejected by admin.\n📄 {req['file_name']}")
     except Exception:
         pass
-    bot.edit_message_text(
+    edit_file_approval_message(
+        call,
         f"❌ File Rejected\n\n👤 User ID: {req['user_id']}\n📄 File: {req['file_name']}",
-        call.message.chat.id, call.message.message_id, reply_markup=create_file_request_panel()
+        create_file_request_panel()
     )
 
 
